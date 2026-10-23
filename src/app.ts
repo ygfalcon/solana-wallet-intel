@@ -11,6 +11,7 @@ import { ExactSvmScheme } from "@x402/svm/exact/server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { z } from "zod";
+import { timingSafeEqual, createHash } from "node:crypto";
 import { enabledAccepts, operationForPath, paidOperations, type PaidOperation } from "./catalog.js";
 import { createCache } from "./cache.js";
 import { loadEnv, type AppEnv, type ChainAccept } from "./config.js";
@@ -220,7 +221,7 @@ export async function createApp(options: CreateAppOptions = {}) {
     const origin = originFrom(env, c.req.url);
     return c.json({
       service: "solana-wallet-x402",
-      description: "Pay-per-call Solana wallet intel for agents. $0.002 USDC gets a quick screen (realized PnL, win rate, bot and smart-money flags; batch 10 for $0.015). Free /wallet/preview. $0.01 USDC gets a wallet's priced holdings, realized/unrealized PnL, win rate, trading cadence and labels (smart-money candidate, bot-like cadence, memecoin trader). $0.005 gets trending Solana tokens with liquidity, volume, age and rug-risk flags. No signup, no API key: x402 v2 on Solana mainnet.",
+      description: "Pay-per-call Solana wallet intel for agents. $0.002 USDC gets a quick screen (realized PnL, win rate, bot and smart-money flags; batch 10 for $0.015). Free /wallet/preview. $0.01 USDC gets a wallet's priced holdings, realized/unrealized PnL (cost basis at historical hourly SOL prices) with per-token breakdown, a 0-100 copy-trade score with explained components, win rate, trading cadence and labels (smart-money candidate, bot-like cadence, memecoin trader). $0.005 gets trending Solana tokens with liquidity, volume, age and rug-risk flags. No signup, no API key: x402 v2 on Solana mainnet.",
       pricing: { "/wallet/quick": "$0.002", "/wallet/quick/batch": "$0.015 (up to 10 wallets)", "/wallet/profile": "$0.01", "/token/trending": "$0.005", "/wallet/preview": "free" },
       quickstart: "npm i @x402/fetch @x402/svm @solana/kit; const f = wrapFetchWithPayment(fetch, client); await (await f(`${origin}/wallet/profile?address=<wallet>`)).json()",
       networkMode: env.networkMode,
@@ -275,6 +276,9 @@ export async function createApp(options: CreateAppOptions = {}) {
       portfolioUsd: p.portfolioUsd ?? null,
       lastActiveAt: p.activity?.lastActiveAt ?? null,
       windowTransactions: p.window?.transactions ?? null,
+      copyTradeScore: p.copyTradeScore?.score ?? null,
+      copyTradeGrade: p.copyTradeScore?.grade ?? null,
+      pnlMethod: p.pnl?.method ?? null,
     };
   }
   const profile50 = (address: string) =>
@@ -486,6 +490,71 @@ export async function createApp(options: CreateAppOptions = {}) {
     await mcp.connect(transport);
     return transport.handleRequest(c.req.raw);
   });
+
+  // Partner channels (Apify Actor, RapidAPI). Same handlers as the x402 routes, but
+  // authenticated by a server-side shared secret instead of a per-call USDC payment.
+  // Secrets live only in Vercel env vars; a missing or placeholder value disables the channel.
+  function secretOk(expected: string | undefined, given: string | undefined): boolean {
+    if (!expected || /^placeholder/i.test(expected) || !given) return false;
+    const a = createHash("sha256").update(expected).digest();
+    const b = createHash("sha256").update(given).digest();
+    return timingSafeEqual(a, b);
+  }
+  const partners: Array<{ prefix: string; channel: string; header: string; secret: () => string | undefined }> = [
+    { prefix: "/internal/v1", channel: "apify", header: "x-swi-internal-key", secret: () => process.env.SWI_INTERNAL_KEY?.trim() },
+    { prefix: "/rapidapi/v1", channel: "rapidapi", header: "x-rapidapi-proxy-secret", secret: () => process.env.RAPIDAPI_PROXY_SECRET?.trim() },
+  ];
+  for (const partner of partners) {
+    app.use(`${partner.prefix}/*`, async (c, next) => {
+      const expected = partner.secret();
+      if (!expected || /^placeholder/i.test(expected)) return c.json({ error: "channel_disabled", message: `The ${partner.channel} channel is not configured.` }, 503);
+      if (!secretOk(expected, c.req.header(partner.header))) return c.json({ error: "unauthorized", message: `Missing or invalid ${partner.header} header.` }, 401);
+      await next();
+      c.header("x-swi-channel", partner.channel);
+      c.header("cache-control", "no-store");
+    });
+    const P = partner.prefix;
+    app.get(`${P}/health`, (c) => c.json({ ok: true, channel: partner.channel, dataCluster: env.walletCluster, asOf: new Date().toISOString() }));
+    app.get(`${P}/wallet/preview`, async (c) => {
+      const address = c.req.query("address")?.trim() ?? "";
+      if (!isSolanaAddress(address)) return c.json({ error: "invalid_address", message: "Query address must be a Solana base58 public key." }, 400);
+      try { return c.json((await cache.getOrSet(`preview:${address}`, 30_000, () => buildWalletPreview(env, address))).value); }
+      catch (error) { return c.json({ error: "upstream_failed", message: error instanceof Error ? error.message : "lookup failed" }, 502); }
+    });
+    app.get(`${P}/wallet/quick`, async (c) => {
+      const address = c.req.query("address")?.trim() ?? "";
+      if (!isSolanaAddress(address)) return c.json({ error: "invalid_address", message: "Query address must be a Solana base58 public key." }, 400);
+      try { return c.json(quickOf((await profile50(address)).value)); }
+      catch (error) { return c.json({ error: "upstream_failed", message: error instanceof Error ? error.message : "lookup failed" }, 502); }
+    });
+    app.get(`${P}/wallet/quick/batch`, async (c) => {
+      const out = await quickBatch(c.req.query("addresses") ?? "");
+      if (!out) return c.json({ error: "invalid_addresses", message: "addresses must be 1 to 10 comma-separated base58 Solana addresses." }, 400);
+      return c.json(out);
+    });
+    app.get(`${P}/wallet/profile`, async (c) => {
+      const address = c.req.query("address")?.trim() ?? "";
+      if (!isSolanaAddress(address)) return c.json({ error: "invalid_address", message: "Query address must be a Solana base58 public key." }, 400);
+      const txLimit = clampInt(c.req.query("txLimit"), 100, 5, 300);
+      if (txLimit === null) return c.json({ error: "invalid_tx_limit", message: "txLimit must be an integer from 5 to 300." }, 400);
+      try {
+        const hit = await cache.getOrSet(`wallet:${env.walletCluster}:${address}:${txLimit}`, 60_000, () => loadWallet(env, address, txLimit));
+        return c.json({ ...hit.value, cached: hit.cached, stale: hit.stale });
+      } catch (error) {
+        return c.json({ error: "upstream_failed", message: error instanceof Error ? error.message : "Wallet lookup failed" }, error instanceof UpstreamError ? 502 : 500);
+      }
+    });
+    app.get(`${P}/token/trending`, async (c) => {
+      const limit = clampInt(c.req.query("limit"), 15, 1, 25);
+      if (limit === null) return c.json({ error: "invalid_limit", message: "limit must be an integer from 1 to 25." }, 400);
+      try {
+        const hit = await cache.getOrSet(`trending:${limit}:${Boolean(env.birdeyeApiKey)}`, 60_000, () => loadTrendingTokens(env, limit));
+        return c.json({ ...hit.value, cached: hit.cached, stale: hit.stale });
+      } catch (error) {
+        return c.json({ error: "upstream_failed", message: error instanceof Error ? error.message : "Trending lookup failed" }, error instanceof UpstreamError ? 502 : 500);
+      }
+    });
+  }
 
   return { app, env, accepts: activeAccepts, operations };
 }
