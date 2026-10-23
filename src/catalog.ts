@@ -54,7 +54,7 @@ export function paidOperations(env: AppEnv): PaidOperation[] {
         tokenCount: 41,
         unpricedTokenCount: 12,
         holdings: [{ mint: "So11111111111111111111111111111111111111112", symbol: "SOL", amount: 12.9, usdValue: 1349.3, sharePct: 98.8 }],
-        trading: { windowHours: 68.6, swapsPerDay: 4.5, txsPerDay: 17.5, medianSecondsBetweenTxs: 360 },
+        trading: { windowHours: 68.6, windowSeconds: 246960, windowTooShort: false, swapsPerDay: 4.5, txsPerDay: 17.5, medianSecondsBetweenTxs: 360 },
         pnl: { realizedUsd: -2772.99, unrealizedUsd: -1935.21, closedTrades: 14, winningTrades: 3, winRate: 0.214, partialCostBasis: true },
         labels: ["active memecoin trader", "high turnover", "net loser"],
         activity: { signatureCount: 50, swapCount: 31, uniqueTokensTraded: 22, lastActiveAt: "2026-10-23T15:17:09.000Z" },
@@ -102,12 +102,12 @@ export function paidOperations(env: AppEnv): PaidOperation[] {
       amount: usdToBaseUnits(env.priceWalletQuick),
       summary: "Quick Solana wallet screen",
       description:
-        "Cheapest Solana wallet screen on x402: realized PnL, win rate, closed trades, swaps/day, bot flag and smart-money flag over the last 50 transactions. Use it to filter copy-trade candidates before buying a full /wallet/profile.",
+        "Cheapest Solana wallet screen on x402: realized PnL, win rate, closed trades, swaps/day, bot flag and smart-money flag over at least the last 50 transactions, paging back toward 24h on busy wallets (up to 300). Rates are null with windowTooShort=true when activity spans under an hour. Use it to filter copy-trade candidates before buying a full /wallet/profile.",
       inputSchema: { type: "object", properties: { address: { type: "string", description: "Solana wallet address in base58." } }, required: ["address"] },
       example: { address: "AVAZvHLR2PcWpDf8BXY4rVxNHYRBytycHkcB5z5QNXYm" },
       outputExample: {
         address: "AVAZvHLR2PcWpDf8BXY4rVxNHYRBytycHkcB5z5QNXYm",
-        realizedUsd: -2776.7, winRate: 0.214, closedTrades: 14, swapsPerDay: 4.5, txsPerDay: 17.5, exchangeLike: false,
+        realizedUsd: -2776.7, winRate: 0.214, closedTrades: 14, swapsPerDay: 4.5, txsPerDay: 17.5, windowSeconds: 246960, windowTooShort: false, exchangeLike: false,
         bot: false, smartMoney: false, netWinner: false, portfolioUsd: 23.74, lastActiveAt: "2026-10-23T15:17:09.000Z",
       },
     },

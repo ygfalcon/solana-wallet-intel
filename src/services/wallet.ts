@@ -26,7 +26,7 @@ export type WalletProfile = {
   portfolioUsd: number | null;
   tokenCount?: number;
   unpricedTokenCount?: number;
-  trading?: { windowHours: number | null; swapsPerDay: number | null; txsPerDay?: number | null; medianSecondsBetweenTxs: number | null };
+  trading?: { windowHours: number | null; windowSeconds?: number | null; windowTooShort?: boolean; swapsPerDay: number | null; txsPerDay?: number | null; medianSecondsBetweenTxs: number | null };
   pnl: ReturnType<typeof estimatePnl>;
   labels: string[];
   sources: string[];
@@ -183,11 +183,22 @@ async function loadRpcActivity(env: AppEnv, address: string, txLimit: number) {
   return { trades, signatureCount: signatures?.length ?? 0, times, source: "solana-rpc" };
 }
 
-async function loadHeliusActivity(env: AppEnv, address: string, txLimit: number) {
+export type HistoryOptions = { minWindowSec?: number; maxTxs?: number; budgetMs?: number };
+
+async function loadHeliusActivity(env: AppEnv, address: string, txLimit: number, opts: HistoryOptions = {}) {
   const txs: HeliusTx[] = [];
   let before: string | undefined;
-  while (txs.length < txLimit) {
-    const n = Math.min(100, txLimit - txs.length);
+  const started = Date.now();
+  const maxTxs = Math.max(txLimit, opts.maxTxs ?? txLimit);
+  const spanOk = () => {
+    if (!opts.minWindowSec || txs.length < 2) return !opts.minWindowSec;
+    const ts = txs.map((t) => t.timestamp).filter(Boolean) as number[];
+    return Math.max(...ts) - Math.min(...ts) >= opts.minWindowSec;
+  };
+  // Page back by count, then (for quick screens) by time until minWindowSec is covered, capped by maxTxs and budgetMs.
+  while (txs.length < txLimit || (!spanOk() && txs.length < maxTxs && Date.now() - started < (opts.budgetMs ?? 4000))) {
+    const target = txs.length < txLimit ? txLimit : maxTxs;
+    const n = Math.min(100, target - txs.length);
     const url = `https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${env.heliusApiKey}&limit=${n}${before ? `&before=${before}` : ""}`;
     let page: HeliusTx[];
     try { page = (await fetchJson<HeliusTx[]>(url, { source: "helius" })) ?? []; }
@@ -284,7 +295,7 @@ async function loadHoldings(env: AppEnv, address: string) {
   return { holdings, sources, warnings };
 }
 
-export async function buildWalletProfile(env: AppEnv, address: string, txLimit: number): Promise<Omit<WalletProfile, "cached" | "stale">> {
+export async function buildWalletProfile(env: AppEnv, address: string, txLimit: number, opts: HistoryOptions = {}): Promise<Omit<WalletProfile, "cached" | "stale">> {
   const warnings: string[] = [];
   const sources: string[] = [];
   let activity: { trades: TradeLeg[][]; signatureCount: number; times: number[]; source: string };
@@ -292,7 +303,7 @@ export async function buildWalletProfile(env: AppEnv, address: string, txLimit: 
   holdingsPromise.catch(() => undefined);
   try {
     activity = env.heliusApiKey
-      ? await loadHeliusActivity(env, address, txLimit)
+      ? await loadHeliusActivity(env, address, txLimit, opts)
       : await loadRpcActivity(env, address, txLimit);
     sources.push(activity.source);
   } catch (error) {
@@ -400,15 +411,23 @@ export async function buildWalletProfile(env: AppEnv, address: string, txLimit: 
   };
 }
 
-function tradingStats(times: number[], swaps: number) {
+export const MIN_RATE_WINDOW_SEC = 3600;
+
+export function tradingStats(times: number[], swaps: number) {
   const sorted = [...times].sort((a, b) => a - b);
   const spanHours = sorted.length > 1 ? (sorted[sorted.length - 1] - sorted[0]) / 3600 : null;
   const gaps = sorted.slice(1).map((t, i) => t - sorted[i]).sort((a, b) => a - b);
   const medianGapSec = gaps.length ? gaps[Math.floor(gaps.length / 2)] : null;
+  const windowSeconds = spanHours === null ? null : Math.round(spanHours * 3600);
+  // Extrapolating a few seconds or minutes of activity to a daily rate gives absurd numbers.
+  const windowTooShort = windowSeconds !== null && windowSeconds < MIN_RATE_WINDOW_SEC;
+  const rateOk = spanHours !== null && spanHours > 0 && !windowTooShort;
   return {
     windowHours: spanHours === null ? null : Math.round(spanHours * 10) / 10,
-    swapsPerDay: spanHours && spanHours > 0 ? Math.round((swaps / spanHours) * 24 * 10) / 10 : null,
-    txsPerDay: spanHours && spanHours > 0 ? Math.round((sorted.length / spanHours) * 24 * 10) / 10 : null,
+    windowSeconds,
+    windowTooShort,
+    swapsPerDay: rateOk ? Math.round((swaps / spanHours!) * 24 * 10) / 10 : null,
+    txsPerDay: rateOk ? Math.round((sorted.length / spanHours!) * 24 * 10) / 10 : null,
     medianSecondsBetweenTxs: medianGapSec,
   };
 }

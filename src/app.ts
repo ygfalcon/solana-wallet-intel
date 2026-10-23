@@ -18,10 +18,10 @@ import { createFacilitator } from "./facilitator.js";
 import { UpstreamError } from "./http.js";
 import { buildOpenApi } from "./openapi.js";
 import { isSolanaAddress } from "./solana.js";
-import { buildWalletProfile, buildWalletPreview, type WalletProfile } from "./services/wallet.js";
+import { buildWalletProfile, buildWalletPreview, type WalletProfile, type HistoryOptions } from "./services/wallet.js";
 import { loadTrending, type TrendingResponse } from "./services/trending.js";
 
-type WalletLoader = (env: AppEnv, address: string, txLimit: number) => Promise<Omit<WalletProfile, "cached" | "stale">>;
+type WalletLoader = (env: AppEnv, address: string, txLimit: number, opts?: HistoryOptions) => Promise<Omit<WalletProfile, "cached" | "stale">>;
 type TrendingLoader = (env: AppEnv, limit: number) => Promise<Omit<TrendingResponse, "cached" | "stale">>;
 
 export type CreateAppOptions = {
@@ -265,6 +265,8 @@ export async function createApp(options: CreateAppOptions = {}) {
       closedTrades: p.pnl?.closedTrades ?? 0,
       swapsPerDay: p.trading?.swapsPerDay ?? null,
       txsPerDay: p.trading?.txsPerDay ?? null,
+      windowSeconds: p.trading?.windowSeconds ?? null,
+      windowTooShort: p.trading?.windowTooShort ?? false,
       exchangeLike: labels.includes("exchange or custodial wallet"),
       bot: labels.includes("bot-like cadence"),
       smartMoney: labels.includes("smart-money candidate"),
@@ -276,7 +278,8 @@ export async function createApp(options: CreateAppOptions = {}) {
     };
   }
   const profile50 = (address: string) =>
-    cache.getOrSet(`wallet:${env.walletCluster}:${address}:50`, 60_000, () => loadWallet(env, address, 50));
+    cache.getOrSet(`quick:${env.walletCluster}:${address}`, 60_000, () =>
+      loadWallet(env, address, 50, { minWindowSec: 86_400, maxTxs: 300, budgetMs: 3_500 }));
   async function quickBatch(raw: string) {
     const list = [...new Set(raw.split(",").map((a) => a.trim()).filter(Boolean))];
     if (list.length === 0 || list.length > 10 || !list.every(isSolanaAddress)) return null;
@@ -392,6 +395,21 @@ export async function createApp(options: CreateAppOptions = {}) {
       content: [{ type: "text", text: "pong" }],
     }));
 
+    mcp.tool(
+      "wallet_preview",
+      "Free Solana wallet teaser: SOL balance, last active time and 24h transaction count. Does not spend USDC. Use wallet_quick ($0.002) for PnL, win rate and bot/smart-money flags.",
+      { address: z.string().describe("Solana wallet address (base58)") },
+      async ({ address }: { address: string }) => {
+        if (!isSolanaAddress(address)) return { isError: true, content: [{ type: "text" as const, text: "Invalid Solana address." }] };
+        try {
+          const hit = await cache.getOrSet(`preview:${address}`, 30_000, () => buildWalletPreview(env, address));
+          return { content: [{ type: "text" as const, text: JSON.stringify(hit.value) }] };
+        } catch (e) {
+          return { isError: true, content: [{ type: "text" as const, text: e instanceof Error ? e.message : "lookup failed" }] };
+        }
+      },
+    );
+
     const walletPaid = await wrapperFor(operations[0]).catch(() => null);
     const walletHandler = walletPaid
       ? walletPaid(async ({ address }: { address: string }) => {
@@ -414,8 +432,8 @@ export async function createApp(options: CreateAppOptions = {}) {
 
     const trendingPaid = await wrapperFor(operations[1]).catch(() => null);
     const trendingHandler = trendingPaid
-      ? trendingPaid(async ({ limit }: { limit?: string }) => {
-          const parsed = clampInt(limit, 15, 1, 25);
+      ? trendingPaid(async ({ limit }: { limit?: number }) => {
+          const parsed = clampInt(limit === undefined ? undefined : String(limit), 15, 1, 25);
           if (parsed === null) {
             return { isError: true, content: [{ type: "text" as const, text: "limit must be an integer from 1 to 25." }] };
           }
@@ -431,7 +449,7 @@ export async function createApp(options: CreateAppOptions = {}) {
     mcp.tool(
       "token_trending",
       `${operations[1].description} Costs ${operations[1].price} USDC.`,
-      { limit: z.string().optional().describe("1 to 25, default 15") },
+      { limit: z.number().int().min(1).max(25).optional().describe("1 to 25, default 15") },
       trendingHandler,
     );
 
