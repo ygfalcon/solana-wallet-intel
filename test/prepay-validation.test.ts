@@ -7,11 +7,14 @@ async function app() {
 }
 
 describe("pre-payment validation", () => {
-  it.each(["/wallet/quick", "/wallet/profile", "/wallet/funding"])("%s rejects a bad address with 400, not 402", async (path) => {
-    const a = await app();
-    expect((await a.fetch(new Request(`https://x.test${path}?address=bad`))).status).toBe(400);
-    expect((await a.fetch(new Request(`https://x.test${path}`))).status).toBe(400);
-  });
+  it.each(["/wallet/quick", "/wallet/profile", "/wallet/funding"])(
+    "%s answers an unpaid probe with 402 even when the address is missing or invalid",
+    async (path) => {
+      const a = await app();
+      expect((await a.fetch(new Request(`https://x.test${path}`))).status).toBe(402);
+      expect((await a.fetch(new Request(`https://x.test${path}?address=bad`))).status).toBe(402);
+    },
+  );
   it("valid address still gets 402", async () => {
     const a = await app();
     const r = await a.fetch(new Request("https://x.test/wallet/quick?address=HD1ryR3dYSXBVNGfJZydbpmnChiE1wrAQkupWWtHt4pM"));

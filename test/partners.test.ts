@@ -50,10 +50,11 @@ describe("partner channels", () => {
 });
 
 describe("/wallet/quick/batch", () => {
-  it("400s bad lists before payment and 402s valid ones", async () => {
+  it("answers unpaid probes with 402, including a bad address list", async () => {
     const a = await app();
-    expect((await a.request(`/wallet/quick/batch?addresses=bad`)).status).toBe(400);
-    expect((await a.request(`/wallet/quick/batch?addresses=${Array(11).fill(A).map((x, i) => (i ? B : x)).join(",")},x`)).status).toBe(400);
+    expect((await a.request(`/wallet/quick/batch?addresses=bad`)).status).toBe(402);
+    expect((await a.request(`/wallet/quick/batch?addresses=${Array(11).fill(A).map((x, i) => (i ? B : x)).join(",")},x`)).status).toBe(402);
     expect((await a.request(`/wallet/quick/batch?addresses=${A},${B}`)).status).toBe(402);
+    expect((await a.request(`/wallet/quick/batch`)).status).toBe(402);
   });
 });
