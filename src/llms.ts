@@ -8,7 +8,7 @@ export const TRENDING_CHECKS = [
 ] as const;
 
 export const TRENDING_PRICE_NOTE =
-  "GET /token/trending costs $0.005 (5000 base units). That price includes holder concentration (top-10 share), mint and freeze authority, LP lock or burn status, and sniper or bundle share of early supply. Each risky result is a plain-English risk flag. The checks are read from free public Solana RPCs. When a check cannot be read, the response says so.";
+  "GET /token/trending costs $0.0018 (1800 base units). That price includes holder concentration (top-10 share), mint and freeze authority, LP lock or burn status, and sniper or bundle share of early supply. Each risky result is a plain-English risk flag. The checks are read from free public Solana RPCs. When a check cannot be read, the response says so.";
 
 export function trendingPricingNote(operation: PaidOperation | undefined) {
   if (!operation || operation.id !== "token_trending") return null;

@@ -451,15 +451,15 @@ describe("funding loader", () => {
 });
 
 describe("llms.txt", () => {
-  it("matches the generator for the public host and prices the funding route at $0.02", () => {
+  it("matches the generator for the public host and prices the funding route at $0.009", () => {
     const expected = buildLlmsTxt("https://solana-wallet-intel-phi.vercel.app", paidOperations(testEnv()));
     const file = readFileSync(new URL("../llms.txt", import.meta.url), "utf8");
     expect(file.trim()).toBe(expected.trim());
     expect(file).toContain("/wallet/funding");
-    expect(file).toContain("$0.02");
-    expect(file).toContain("20000");
+    expect(file).toContain("$0.009");
+    expect(file).toContain("9000");
     expect(file).toContain("wallet_funding");
-    expect(file).toContain("$0.01");
-    expect(file).toContain("$0.005");
+    expect(file).toContain("$0.009");
+    expect(file).toContain("$0.0018");
   });
 });

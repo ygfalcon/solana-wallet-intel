@@ -141,9 +141,9 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): AppEnv {
     jupiterApiKey: trimmed(source.JUPITER_API_KEY),
     birdeyeApiKey: trimmed(source.BIRDEYE_API_KEY),
     solanaRpcUrl: trimmed(source.SOLANA_RPC_URL) ?? defaultRpc,
-    priceWalletProfile: trimmed(source.PRICE_WALLET_PROFILE) ?? "$0.01",
-    priceTokenTrending: trimmed(source.PRICE_TOKEN_TRENDING) ?? "$0.005",
-    priceWalletFunding: trimmed(source.PRICE_WALLET_FUNDING) ?? "$0.02",
+    priceWalletProfile: trimmed(source.PRICE_WALLET_PROFILE) ?? "$0.009",
+    priceTokenTrending: trimmed(source.PRICE_TOKEN_TRENDING) ?? "$0.0018",
+    priceWalletFunding: trimmed(source.PRICE_WALLET_FUNDING) ?? "$0.009",
     priceWalletQuick: trimmed(source.PRICE_WALLET_QUICK) ?? "$0.002",
     priceWalletQuickBatch: trimmed(source.PRICE_WALLET_QUICK_BATCH) ?? "$0.015",
   };
