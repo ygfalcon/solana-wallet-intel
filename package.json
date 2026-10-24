@@ -1,5 +1,5 @@
 {
-  "name": "solana-wallet-intel",
+  "name": "solana-wallet-x402",
   "version": "1.0.0",
   "description": "x402-paywalled Solana wallet and trending-token API. Agents pay per call in USDC on Solana or Base.",
   "type": "module",
@@ -11,9 +11,12 @@
     "start": "tsx src/index.ts",
     "build": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "pay:devnet": "tsx scripts/devnet-pay.ts",
+    "check:facilitator": "tsx scripts/check-facilitator.ts",
+    "smoke:data": "tsx scripts/smoke-data.ts"
   },
-  "license": "MIT",
+  "license": "ISC",
   "dependencies": {
     "@coinbase/cdp-sdk": "^1.60.0",
     "@hono/node-server": "^1.19.9",
@@ -36,9 +39,5 @@
     "@types/node": "^22.19.1",
     "typescript": "^5.9.3",
     "vitest": "^3.2.4"
-  },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/ygfalcon/solana-wallet-intel"
   }
 }

@@ -1,19 +1,43 @@
 import { QUOTE_MINTS, type AppEnv } from "../config.js";
-import { estimatePnl, labelWallet, type TradeLeg } from "../analytics.js";
-import { fetchJson, UpstreamError } from "../http.js";
+import {
+  describeWallet,
+  estimatePnl,
+  isSpeculativeSwap,
+  isStableMint,
+  isTwoSided,
+  medianGapSeconds,
+  netLegs,
+  summarizeWallet,
+  type TradeEvent,
+  type TradeLeg,
+} from "../analytics.js";
+import { fetchJson, redactSecrets, UpstreamError } from "../http.js";
+import {
+  accumulateHoldings,
+  holdingFromAsset,
+  isLikelyNft,
+  nativeSolHolding,
+  parseUiAmount,
+  presentHoldings,
+  type AssetLike,
+  type RawHolding,
+} from "../holdings.js";
 import { SOL_MINT, TOKEN_2022_PROGRAM, TOKEN_PROGRAM } from "../solana.js";
-import { loadTokenMeta } from "./prices.js";
+import { positiveUsd, loadTokenMeta } from "./prices.js";
+import { closeAt, loadSolUsdSeries } from "./sol-history.js";
 
 export type WalletProfile = {
   address: string;
   asOf: string;
   dataCluster: AppEnv["walletCluster"];
+  summary: string;
   window: { transactions: number; from: string | null; to: string | null };
   activity: {
     signatureCount: number;
     swapCount: number;
     uniqueTokensTraded: number;
     lastActiveAt: string | null;
+    medianSwapGapSeconds: number | null;
   };
   holdings: Array<{
     mint: string;
@@ -23,12 +47,12 @@ export type WalletProfile = {
     usdValue: number | null;
     sharePct: number | null;
   }>;
+  omittedHoldings: number;
+  unpricedHoldings: number;
   portfolioUsd: number | null;
-  tokenCount?: number;
-  unpricedTokenCount?: number;
-  trading?: { windowHours: number | null; windowSeconds?: number | null; windowTooShort?: boolean; swapsPerDay: number | null; txsPerDay?: number | null; medianSecondsBetweenTxs: number | null };
   pnl: ReturnType<typeof estimatePnl>;
   labels: string[];
+  labelDetails: ReturnType<typeof describeWallet>["details"];
   sources: string[];
   warnings: string[];
   cached: boolean;
@@ -46,6 +70,7 @@ type ParsedTx = {
     postBalances?: number[];
     preTokenBalances?: TokenBalance[];
     postTokenBalances?: TokenBalance[];
+    loadedAddresses?: { writable?: string[]; readonly?: string[] };
   } | null;
   transaction?: { message?: { accountKeys?: Array<string | { pubkey: string }> } };
 };
@@ -53,7 +78,7 @@ type ParsedTx = {
 type TokenBalance = {
   owner?: string;
   mint?: string;
-  uiTokenAmount?: { uiAmountString?: string; uiAmount?: number | null };
+  uiTokenAmount?: { uiAmountString?: string; uiAmount?: number | null; amount?: string; decimals?: number };
 };
 
 type HeliusTransfer = {
@@ -68,31 +93,43 @@ type HeliusTx = {
   signature?: string;
   timestamp?: number;
   type?: string;
+  transactionError?: unknown;
   tokenTransfers?: HeliusTransfer[];
   nativeTransfers?: HeliusTransfer[];
 };
 
-type AssetItem = {
-  id?: string;
-  content?: { metadata?: { name?: string; symbol?: string } };
-  token_info?: {
-    balance?: number;
-    decimals?: number;
-    symbol?: string;
-    price_info?: { price_per_token?: number };
-  };
-  interface?: string;
+type TimedTrade = TradeEvent;
+
+type TokenAccountResponse = {
+  value: Array<{
+    account: {
+      data: {
+        parsed?: {
+          info?: {
+            mint?: string;
+            tokenAmount?: { uiAmountString?: string; uiAmount?: number | null; amount?: string; decimals?: number };
+          };
+        };
+      };
+    };
+  }>;
 };
 
 function accountKey(key: string | { pubkey: string }): string {
   return typeof key === "string" ? key : key.pubkey;
 }
 
-function uiAmount(balance: TokenBalance | undefined): number {
-  if (!balance?.uiTokenAmount) return 0;
-  const raw = balance.uiTokenAmount.uiAmountString ?? balance.uiTokenAmount.uiAmount;
-  const value = Number(raw ?? 0);
-  return Number.isFinite(value) ? value : 0;
+function resolvedAccountKeys(tx: ParsedTx): string[] {
+  const messageKeys = (tx.transaction?.message?.accountKeys ?? []).map(accountKey);
+  const balanceCount = tx.meta?.preBalances?.length ?? messageKeys.length;
+  if (messageKeys.length >= balanceCount) return messageKeys;
+  const keys = [...messageKeys];
+  const loaded = [...(tx.meta?.loadedAddresses?.writable ?? []), ...(tx.meta?.loadedAddresses?.readonly ?? [])];
+  for (const key of loaded) {
+    if (keys.length >= balanceCount) break;
+    if (!keys.includes(key)) keys.push(key);
+  }
+  return keys;
 }
 
 export function legsFromParsedTransaction(tx: ParsedTx, owner: string): TradeLeg[] {
@@ -101,18 +138,18 @@ export function legsFromParsedTransaction(tx: ParsedTx, owner: string): TradeLeg
   const pre = new Map<string, number>();
   const post = new Map<string, number>();
   for (const balance of tx.meta.preTokenBalances ?? []) {
-    if (balance.owner === owner && balance.mint) pre.set(balance.mint, uiAmount(balance));
+    if (balance.owner === owner && balance.mint) pre.set(balance.mint, parseUiAmount(balance.uiTokenAmount).amount);
   }
   for (const balance of tx.meta.postTokenBalances ?? []) {
-    if (balance.owner === owner && balance.mint) post.set(balance.mint, uiAmount(balance));
+    if (balance.owner === owner && balance.mint) post.set(balance.mint, parseUiAmount(balance.uiTokenAmount).amount);
   }
   for (const mint of new Set([...pre.keys(), ...post.keys()])) {
     const delta = (post.get(mint) ?? 0) - (pre.get(mint) ?? 0);
     if (Math.abs(delta) > 0) legs.push({ mint, delta });
   }
 
-  const keys = tx.transaction?.message?.accountKeys ?? [];
-  const index = keys.findIndex((key) => accountKey(key) === owner);
+  const keys = resolvedAccountKeys(tx);
+  const index = keys.findIndex((key) => key === owner);
   if (index >= 0) {
     const preLamports = tx.meta.preBalances?.[index] ?? 0;
     const postLamports = tx.meta.postBalances?.[index] ?? 0;
@@ -121,13 +158,15 @@ export function legsFromParsedTransaction(tx: ParsedTx, owner: string): TradeLeg
     const sol = deltaLamports / 1_000_000_000;
     if (Math.abs(sol) >= 0.00001) legs.push({ mint: SOL_MINT, delta: sol });
   }
-  return legs;
+  return netLegs(legs);
 }
 
 export function legsFromHelius(tx: HeliusTx, owner: string): TradeLeg[] {
+  if (tx.transactionError || tx.type === "FAILED") return [];
   const legs: TradeLeg[] = [];
   for (const transfer of tx.tokenTransfers ?? []) {
-    if (!transfer.mint || transfer.tokenAmount === undefined) continue;
+    if (!transfer.mint || transfer.tokenAmount == null || !Number.isFinite(transfer.tokenAmount)) continue;
+    if (transfer.tokenAmount === 0) continue;
     if (transfer.toUserAccount === owner && transfer.fromUserAccount !== owner) {
       legs.push({ mint: transfer.mint, delta: transfer.tokenAmount });
     } else if (transfer.fromUserAccount === owner && transfer.toUserAccount !== owner) {
@@ -143,7 +182,7 @@ export function legsFromHelius(tx: HeliusTx, owner: string): TradeLeg[] {
       legs.push({ mint: SOL_MINT, delta: -sol });
     }
   }
-  return legs;
+  return netLegs(legs);
 }
 
 async function rpc<T>(url: string, method: string, params: unknown[]): Promise<T> {
@@ -158,296 +197,360 @@ async function rpc<T>(url: string, method: string, params: unknown[]): Promise<T
 }
 
 async function loadRpcActivity(env: AppEnv, address: string, txLimit: number) {
-  const signatures = await rpc<Array<{ signature: string; blockTime: number | null }>>(
+  const signatures = await rpc<Array<{ signature: string; blockTime: number | null; err?: unknown }>>(
     env.solanaRpcUrl,
     "getSignaturesForAddress",
     [address, { limit: txLimit }],
   );
+  const rows = signatures ?? [];
   const transactions = await Promise.all(
-    (signatures ?? []).slice(0, txLimit).map(async (item) => {
+    rows.slice(0, txLimit).map(async (item) => {
+      if (item.err) return { legs: [] as TradeLeg[], blockTime: item.blockTime };
       try {
         const tx = await rpc<ParsedTx | null>(env.solanaRpcUrl, "getTransaction", [
           item.signature,
           { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 },
         ]);
-        return { tx, blockTime: item.blockTime };
+        return { legs: tx ? legsFromParsedTransaction(tx, address) : [], blockTime: item.blockTime };
       } catch {
-        return { tx: null, blockTime: item.blockTime };
+        return { legs: [] as TradeLeg[], blockTime: item.blockTime };
       }
     }),
   );
-  const trades = transactions
-    .map((item) => (item.tx ? legsFromParsedTransaction(item.tx, address) : []))
-    .filter((legs) => legs.length > 0);
-  const times = (signatures ?? []).map((item) => item.blockTime).filter((time): time is number => Boolean(time));
-  return { trades, signatureCount: signatures?.length ?? 0, times, source: "solana-rpc" };
+  const trades: TimedTrade[] = transactions
+    .filter((item) => item.legs.length > 0)
+    .map((item) => ({ at: item.blockTime, legs: item.legs }));
+  const times = rows.map((item) => item.blockTime).filter((time): time is number => Boolean(time));
+  return { trades, signatureCount: rows.length, times, source: "solana-rpc" };
 }
 
-export type HistoryOptions = { minWindowSec?: number; maxTxs?: number; budgetMs?: number };
-
-async function loadHeliusActivity(env: AppEnv, address: string, txLimit: number, opts: HistoryOptions = {}) {
-  const txs: HeliusTx[] = [];
-  let before: string | undefined;
-  const started = Date.now();
-  const maxTxs = Math.max(txLimit, opts.maxTxs ?? txLimit);
-  const spanOk = () => {
-    if (!opts.minWindowSec || txs.length < 2) return !opts.minWindowSec;
-    const ts = txs.map((t) => t.timestamp).filter(Boolean) as number[];
-    return Math.max(...ts) - Math.min(...ts) >= opts.minWindowSec;
-  };
-  // Page back by count, then (for quick screens) by time until minWindowSec is covered, capped by maxTxs and budgetMs.
-  while (txs.length < txLimit || (!spanOk() && txs.length < maxTxs && Date.now() - started < (opts.budgetMs ?? 4000))) {
-    const target = txs.length < txLimit ? txLimit : maxTxs;
-    const n = Math.min(100, target - txs.length);
-    const url = `https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${env.heliusApiKey}&limit=${n}${before ? `&before=${before}` : ""}`;
-    let page: HeliusTx[];
-    try { page = (await fetchJson<HeliusTx[]>(url, { source: "helius" })) ?? []; }
-    catch (e) { if (txs.length === 0) throw e; break; }
-    txs.push(...page);
-    before = page[page.length - 1]?.signature;
-    if (page.length < n || !before) break;
-  }
-  const trades = (txs ?? [])
-    .map((tx) => legsFromHelius(tx, address))
-    .filter((legs) => legs.length > 0);
-  const times = (txs ?? []).map((tx) => tx.timestamp).filter((time): time is number => Boolean(time));
-  return { trades, signatureCount: txs?.length ?? 0, times, source: "helius" };
+async function loadHeliusActivity(env: AppEnv, address: string, txLimit: number) {
+  const url = `https://api.helius.xyz/v0/addresses/${address}/transactions?api-key=${env.heliusApiKey}&limit=${txLimit}`;
+  const txs = await fetchJson<HeliusTx[]>(url, { source: "helius" });
+  const rows = txs ?? [];
+  const trades: TimedTrade[] = rows
+    .map((tx) => ({ at: tx.timestamp ?? null, legs: legsFromHelius(tx, address) }))
+    .filter((trade) => trade.legs.length > 0);
+  const times = rows.map((tx) => tx.timestamp).filter((time): time is number => Boolean(time));
+  return { trades, signatureCount: rows.length, times, source: "helius" };
 }
 
-async function loadHoldings(env: AppEnv, address: string) {
-  const holdings = new Map<string, { amount: number; symbol: string | null; name: string | null; priceHint: number | null }>();
+type DasResult = { items?: AssetLike[]; nativeBalance?: { lamports?: number } };
+
+async function loadDasHoldings(
+  env: AppEnv,
+  address: string,
+): Promise<{ items: RawHolding[]; warnings: string[]; sawNativeBalance: boolean }> {
   const warnings: string[] = [];
-  const sources: string[] = [];
-
-  if (env.heliusApiKey) {
+  let lastError: unknown;
+  for (const method of ["searchAssets", "getAssetsByOwner"] as const) {
     try {
-      const body = await fetchJson<RpcResponse<{ items?: AssetItem[]; nativeBalance?: { lamports?: number } }>>(
-        env.solanaRpcUrl,
-        {
+      const collected: RawHolding[] = [];
+      let nativeLamports = 0;
+      let sawNativeBalance = false;
+      let skipped = 0;
+      for (let page = 1; page <= 3; page += 1) {
+        const params =
+          method === "searchAssets"
+            ? {
+                ownerAddress: address,
+                tokenType: "fungible",
+                page,
+                limit: 1000,
+                displayOptions: { showNativeBalance: true, showFungible: true },
+              }
+            : {
+                ownerAddress: address,
+                page,
+                limit: 1000,
+                displayOptions: { showFungible: true, showNativeBalance: true },
+              };
+        const body = await fetchJson<RpcResponse<DasResult>>(env.solanaRpcUrl, {
           source: "helius",
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            jsonrpc: "2.0",
-            id: "assets",
-            method: "searchAssets",
-            params: {
-              ownerAddress: address,
-              tokenType: "fungible",
-              page: 1,
-              limit: 1000,
-              displayOptions: { showNativeBalance: true },
-            },
-          }),
-        },
-      );
-      sources.push("helius");
-      const lamports = body.result?.nativeBalance?.lamports ?? 0;
-      if (lamports > 0) {
-        holdings.set(SOL_MINT, { amount: lamports / 1_000_000_000, symbol: "SOL", name: "Solana", priceHint: null });
-      }
-      for (const item of body.result?.items ?? []) {
-        const info = item.token_info;
-        if (!item.id || !info || info.balance === undefined || info.decimals === undefined) continue;
-        const amount = info.balance / 10 ** info.decimals;
-        if (amount <= 0) continue;
-        // Skip NFT-like and spam-airdrop units (decimals 0, single unit) so they don't crowd out real tokens.
-        if (info.decimals === 0 && amount <= 1) continue;
-        holdings.set(item.id, {
-          amount,
-          symbol: info.symbol ?? item.content?.metadata?.symbol ?? null,
-          name: item.content?.metadata?.name ?? null,
-          priceHint: info.price_info?.price_per_token ?? null,
+          body: JSON.stringify({ jsonrpc: "2.0", id: method, method, params }),
         });
+        if (body.error) throw new UpstreamError(body.error.message ?? "RPC error", "helius");
+        if (page === 1 && body.result && Object.prototype.hasOwnProperty.call(body.result, "nativeBalance")) {
+          sawNativeBalance = true;
+          nativeLamports = body.result.nativeBalance?.lamports ?? 0;
+        }
+        const items = body.result?.items ?? [];
+        for (const item of items) {
+          const holding = holdingFromAsset(item);
+          if (holding) collected.push(holding);
+          else if (item.id && item.interface && item.interface !== "FungibleToken" && item.interface !== "FungibleAsset") {
+            skipped += 1;
+          }
+        }
+        if (items.length < 1000) break;
       }
-      return { holdings, sources, warnings };
+      const sol = nativeSolHolding(nativeLamports);
+      if (sol) collected.push(sol);
+      if (skipped > 0) warnings.push(`Skipped ${skipped} non-fungible assets.`);
+      return { items: collected, warnings, sawNativeBalance };
     } catch (error) {
-      warnings.push(error instanceof Error ? error.message : "Helius asset lookup failed");
+      lastError = error;
+    }
+  }
+  throw lastError instanceof Error ? lastError : new UpstreamError("Helius asset lookup failed", "helius");
+}
+
+function holdingFromRpcAccount(account: TokenAccountResponse["value"][number]): RawHolding | null {
+  const info = account.account.data.parsed?.info;
+  if (!info?.mint) return null;
+  const parsed = parseUiAmount(info.tokenAmount);
+  if (parsed.amount <= 0 || isLikelyNft(parsed.decimals, parsed.amount)) return null;
+  return {
+    mint: info.mint,
+    amount: parsed.amount,
+    symbol: null,
+    name: null,
+    priceHint: null,
+    decimals: parsed.decimals,
+  };
+}
+
+async function loadRpcHoldings(env: AppEnv, address: string): Promise<RawHolding[]> {
+  const [lamports, tokenAccounts, token2022] = await Promise.all([
+    rpc<number>(env.solanaRpcUrl, "getBalance", [address]),
+    rpc<TokenAccountResponse>(env.solanaRpcUrl, "getTokenAccountsByOwner", [
+      address,
+      { programId: TOKEN_PROGRAM },
+      { encoding: "jsonParsed" },
+    ]),
+    rpc<TokenAccountResponse>(env.solanaRpcUrl, "getTokenAccountsByOwner", [
+      address,
+      { programId: TOKEN_2022_PROGRAM },
+      { encoding: "jsonParsed" },
+    ]).catch(() => ({ value: [] })),
+  ]);
+  const items: RawHolding[] = [];
+  const sol = nativeSolHolding(lamports);
+  if (sol) items.push(sol);
+  for (const account of [...(tokenAccounts.value ?? []), ...(token2022.value ?? [])]) {
+    const holding = holdingFromRpcAccount(account);
+    if (holding) items.push(holding);
+  }
+  return items;
+}
+
+async function loadHoldings(env: AppEnv, address: string) {
+  const warnings: string[] = [];
+  const sources: string[] = [];
+  if (env.heliusApiKey) {
+    try {
+      const das = await loadDasHoldings(env, address);
+      sources.push("helius");
+      warnings.push(...das.warnings);
+      if (!das.sawNativeBalance) {
+        try {
+          const lamports = await rpc<number>(env.solanaRpcUrl, "getBalance", [address]);
+          const sol = nativeSolHolding(lamports);
+          if (sol) das.items.push(sol);
+          sources.push("solana-rpc");
+        } catch (error) {
+          warnings.push(redactSecrets(error instanceof Error ? error.message : "Native SOL balance lookup failed"));
+        }
+      }
+      return { items: das.items, sources, warnings };
+    } catch (error) {
+      warnings.push(redactSecrets(error instanceof Error ? error.message : "Helius asset lookup failed"));
     }
   }
 
-  const [lamports, tokenAccounts, token2022] = await Promise.all([
-    rpc<number>(env.solanaRpcUrl, "getBalance", [address]),
-    rpc<{ value: Array<{ account: { data: { parsed?: { info?: { mint?: string; tokenAmount?: { uiAmount?: number } } } } } }> }>(
-      env.solanaRpcUrl,
-      "getTokenAccountsByOwner",
-      [address, { programId: TOKEN_PROGRAM }, { encoding: "jsonParsed" }],
-    ),
-    rpc<{ value: Array<{ account: { data: { parsed?: { info?: { mint?: string; tokenAmount?: { uiAmount?: number } } } } } }> }>(
-      env.solanaRpcUrl,
-      "getTokenAccountsByOwner",
-      [address, { programId: TOKEN_2022_PROGRAM }, { encoding: "jsonParsed" }],
-    ).catch(() => ({ value: [] })),
-  ]);
   sources.push("solana-rpc");
   if (!env.heliusApiKey) {
     warnings.push("HELIUS_API_KEY is unset. Holdings and recent swaps come from the public Solana RPC.");
   }
-  if (lamports > 0) {
-    holdings.set(SOL_MINT, { amount: lamports / 1_000_000_000, symbol: "SOL", name: "Solana", priceHint: null });
-  }
-  for (const account of [...(tokenAccounts.value ?? []), ...(token2022.value ?? [])]) {
-    const info = account.account.data.parsed?.info;
-    const amount = info?.tokenAmount?.uiAmount ?? 0;
-    if (!info?.mint || amount <= 0) continue;
-    holdings.set(info.mint, { amount, symbol: null, name: null, priceHint: null });
-  }
-  return { holdings, sources, warnings };
+  const items = await loadRpcHoldings(env, address);
+  return { items, sources, warnings };
 }
 
-export async function buildWalletProfile(env: AppEnv, address: string, txLimit: number, opts: HistoryOptions = {}): Promise<Omit<WalletProfile, "cached" | "stale">> {
+function stampExecutionPrices(
+  trades: TimedTrade[],
+  sol: { prices: Map<number, number>; granularity: number },
+): boolean {
+  let missingSol = false;
+  for (const trade of trades) {
+    for (const leg of trade.legs) {
+      if (isStableMint(leg.mint)) {
+        leg.usdPrice = 1;
+        continue;
+      }
+      if (leg.mint !== SOL_MINT) continue;
+      if (trade.at == null) {
+        missingSol = true;
+        continue;
+      }
+      const price = closeAt(sol.prices, trade.at, sol.granularity);
+      if (price == null) missingSol = true;
+      else leg.usdPrice = price;
+    }
+  }
+  return missingSol;
+}
+
+export async function buildWalletProfile(
+  env: AppEnv,
+  address: string,
+  txLimit: number,
+): Promise<Omit<WalletProfile, "cached" | "stale">> {
   const warnings: string[] = [];
   const sources: string[] = [];
-  let activity: { trades: TradeLeg[][]; signatureCount: number; times: number[]; source: string };
-  const holdingsPromise = loadHoldings(env, address);
-  holdingsPromise.catch(() => undefined);
+  let activity: { trades: TimedTrade[]; signatureCount: number; times: number[]; source: string };
   try {
     activity = env.heliusApiKey
-      ? await loadHeliusActivity(env, address, txLimit, opts)
+      ? await loadHeliusActivity(env, address, txLimit)
       : await loadRpcActivity(env, address, txLimit);
     sources.push(activity.source);
   } catch (error) {
     if (!env.heliusApiKey) throw error;
-    warnings.push(error instanceof Error ? error.message : "Helius history failed");
+    warnings.push(redactSecrets(error instanceof Error ? error.message : "Helius history failed"));
     activity = await loadRpcActivity(env, address, txLimit);
     sources.push(activity.source);
   }
 
-  const holdingResult = await holdingsPromise;
+  const holdingResult = await loadHoldings(env, address);
   sources.push(...holdingResult.sources);
   warnings.push(...holdingResult.warnings);
+  const merged = accumulateHoldings(holdingResult.items);
 
-  // Priority: SOL, traded mints, then holdings that Helius already prices, then the long tail.
-  const held = [...holdingResult.holdings.entries()];
-  const mints = [
-    SOL_MINT,
-    ...activity.trades.flatMap((legs) => legs.map((leg) => leg.mint)),
-    ...held.filter(([, h]) => h.priceHint != null).map(([m]) => m),
-    ...held.filter(([, h]) => h.priceHint == null).map(([m]) => m),
-  ];
-  const traded = [SOL_MINT, ...activity.trades.flatMap((legs) => legs.map((leg) => leg.mint))];
-  // Deterministic set: SOL + traded + Helius-hinted holdings + unhinted holdings sorted by mint, capped at 250.
-  const ordered = [...new Set(mints)];
-  const head = ordered.filter((m) => traded.includes(m) || holdingResult.holdings.get(m)?.priceHint != null);
-  const tail = ordered.filter((m) => !head.includes(m)).sort();
-  const meta = await loadTokenMeta(env, [...head, ...tail].slice(0, Math.max(250, head.length)), traded);
-  sources.push("jupiter");
+  const usesSol = activity.trades.some((trade) => trade.legs.some((leg) => leg.mint === SOL_MINT));
+  if (usesSol) {
+    const history = await loadSolUsdSeries(activity.trades.flatMap((trade) => (trade.at == null ? [] : [trade.at])));
+    const missingSolPrice = stampExecutionPrices(activity.trades, history);
+    if (!history.ok) {
+      warnings.push("Historical SOL prices were unavailable, so SOL notionals in this window use the current SOL price.");
+    } else {
+      sources.push("coinbase");
+      if (missingSolPrice) {
+        warnings.push("Some SOL transfers had no hourly price, so those notionals use the current SOL price.");
+      }
+    }
+  } else {
+    for (const trade of activity.trades) {
+      for (const leg of trade.legs) {
+        if (isStableMint(leg.mint)) leg.usdPrice = 1;
+      }
+    }
+  }
+
+  const mints = [...merged.map((holding) => holding.mint), ...activity.trades.flatMap((trade) => trade.legs.map((leg) => leg.mint)), SOL_MINT];
+  const priced = await loadTokenMeta(env, mints);
+  sources.push(...priced.sources);
+
+  const drafts = merged.map((holding) => {
+    const token = priced.meta.get(holding.mint);
+    const price = token?.priceUsd ?? positiveUsd(holding.priceHint);
+    return {
+      mint: holding.mint,
+      symbol: holding.symbol ?? token?.symbol ?? null,
+      name: holding.name ?? token?.name ?? null,
+      amount: holding.amount,
+      usdValue: price == null ? null : holding.amount * price,
+    };
+  });
+  const presented = presentHoldings(drafts, 10_000);
+  const holdings = presented.holdings.slice(0, 12);
+  const omittedHoldings = Math.max(0, presented.holdings.length - holdings.length);
+
   const prices = new Map<string, number>();
-  for (const [mint, token] of meta) {
-    const hint = holdingResult.holdings.get(mint)?.priceHint;
-    // Spam filter: a non-hinted price only counts if the pool has at least $5k liquidity.
-    const liquid = token.liquidityUsd == null ? traded.includes(mint) : token.liquidityUsd >= 5_000;
-    const price = (liquid ? token.priceUsd : null) ?? hint;
-    if (price !== null && price !== undefined) prices.set(mint, price);
+  for (const [mint, token] of priced.meta) {
+    const hint = merged.find((holding) => holding.mint === mint)?.priceHint;
+    const price = token.priceUsd ?? positiveUsd(hint);
+    if (price != null) prices.set(mint, price);
+  }
+  for (const holding of merged) {
+    const hint = positiveUsd(holding.priceHint);
+    if (hint != null && !prices.has(holding.mint)) prices.set(holding.mint, hint);
   }
 
-  const allHoldings = [...holdingResult.holdings.entries()]
-    .map(([mint, holding]) => {
-      const token = meta.get(mint);
-      const price = prices.get(mint) ?? null;
-      return {
-        mint,
-        symbol: holding.symbol ?? token?.symbol ?? null,
-        name: holding.name ?? token?.name ?? null,
-        amount: holding.amount,
-        usdValue: price === null ? null : Math.round(holding.amount * price * 100) / 100,
-        sharePct: null as number | null,
-      };
-    })
-    .sort((a, b) => (b.usdValue ?? -1) - (a.usdValue ?? -1));
-  const holdings = allHoldings.slice(0, 15);
-  const tokenCount = allHoldings.length;
-  const unpricedCount = allHoldings.filter((h) => h.usdValue === null).length;
-
-  const portfolio = allHoldings.reduce((sum, holding) => sum + (holding.usdValue ?? 0), 0);
-  const priced = allHoldings.some((holding) => holding.usdValue !== null);
-  for (const holding of holdings) {
-    holding.sharePct = priced && portfolio > 0 && holding.usdValue !== null
-      ? Math.round((holding.usdValue / portfolio) * 1000) / 10
-      : null;
-  }
-
-  // Upstreams return newest-first; replay oldest-first so buys open lots before sells close them.
-  const pnl = estimatePnl([...activity.trades].reverse(), prices);
-  const memecoinSwaps = activity.trades.filter((legs) =>
-    legs.some((leg) => !QUOTE_MINTS.has(leg.mint) && Math.abs(leg.delta) > 0),
-  ).length;
+  const pnl = estimatePnl(activity.trades, prices);
+  const swaps = activity.trades.filter((trade) => isTwoSided(trade.legs));
+  const memecoinSwaps = swaps.filter((trade) => isSpeculativeSwap(trade.legs)).length;
   const times = [...activity.times].sort((a, b) => a - b);
   const lastActiveAt = times.length ? new Date(times[times.length - 1] * 1000).toISOString() : null;
+  const firstActiveAt = times.length ? new Date(times[0] * 1000).toISOString() : null;
+  const historyTruncated = activity.signatureCount >= txLimit;
+  const swapTimes = swaps.map((trade) => trade.at).filter((time): time is number => time != null);
+  const medianSwapGap = medianGapSeconds(swapTimes);
+  const described = describeWallet({
+    swapCount: swaps.length,
+    lastActiveAt,
+    firstActiveAt,
+    historyTruncated,
+    medianSwapGapSeconds: medianSwapGap,
+    signatureCount: activity.signatureCount,
+    holdings: presented.holdings,
+    memecoinSwaps,
+    pnl,
+  });
+
+  if (historyTruncated) {
+    warnings.push(`Transaction history is capped at ${txLimit} signatures. PnL ignores older trades.`);
+  }
+  if (presented.unpricedHoldings > 0) {
+    warnings.push(
+      `${presented.unpricedHoldings} holdings have no USD price and are excluded from portfolio value.`,
+    );
+  }
+  if (pnl.partialCostBasis) {
+    warnings.push("Cost basis is partial for this window. Realized PnL omits sells that had no in-window basis, and some open lots may be unpriced.");
+  }
+  if (omittedHoldings > 0) {
+    warnings.push(`Showing 12 of ${presented.holdings.length} fungible holdings, ranked by USD value.`);
+  }
+
+  const uniqueTokensTraded = new Set(
+    swaps.flatMap((trade) => trade.legs.map((leg) => leg.mint).filter((mint) => !QUOTE_MINTS.has(mint))),
+  ).size;
+  const summary = summarizeWallet({
+    portfolioUsd: presented.portfolioUsd,
+    pricedHoldings: presented.pricedHoldings,
+    holdings,
+    omittedHoldings,
+    unpricedHoldings: presented.unpricedHoldings,
+    window: {
+      transactions: activity.signatureCount,
+      from: firstActiveAt,
+      to: lastActiveAt,
+    },
+    activity: {
+      signatureCount: activity.signatureCount,
+      swapCount: swaps.length,
+      uniqueTokensTraded,
+    },
+    pnl,
+    labels: described.labels,
+  });
 
   return {
     address,
     asOf: new Date().toISOString(),
     dataCluster: env.walletCluster,
+    summary,
     window: {
       transactions: activity.signatureCount,
-      from: times.length ? new Date(times[0] * 1000).toISOString() : null,
+      from: firstActiveAt,
       to: lastActiveAt,
     },
     activity: {
       signatureCount: activity.signatureCount,
-      swapCount: activity.trades.filter((legs) => legs.some((leg) => leg.delta > 0) && legs.some((leg) => leg.delta < 0)).length,
-      uniqueTokensTraded: new Set(
-        activity.trades.flatMap((legs) => legs.map((leg) => leg.mint)).filter((mint) => !QUOTE_MINTS.has(mint)),
-      ).size,
+      swapCount: swaps.length,
+      uniqueTokensTraded,
       lastActiveAt,
+      medianSwapGapSeconds: medianSwapGap,
     },
     holdings,
-    tokenCount,
-    unpricedTokenCount: unpricedCount,
-    trading: tradingStats(activity.times, activity.trades.filter((legs) => legs.some((leg) => leg.delta > 0) && legs.some((leg) => leg.delta < 0)).length),
-    portfolioUsd: priced ? Math.round(portfolio * 100) / 100 : null,
+    omittedHoldings,
+    unpricedHoldings: presented.unpricedHoldings,
+    portfolioUsd: presented.portfolioUsd,
     pnl,
-    labels: labelWallet({
-      swapCount: activity.trades.filter((legs) => legs.some((leg) => leg.delta > 0) && legs.some((leg) => leg.delta < 0)).length,
-      lastActiveAt,
-      holdings,
-      memecoinSwaps,
-      pnl,
-      times: activity.times,
-    }),
+    labels: described.labels,
+    labelDetails: described.details,
     sources: [...new Set(sources)],
-    warnings,
-  };
-}
-
-export const MIN_RATE_WINDOW_SEC = 3600;
-
-export function tradingStats(times: number[], swaps: number) {
-  const sorted = [...times].sort((a, b) => a - b);
-  const spanHours = sorted.length > 1 ? (sorted[sorted.length - 1] - sorted[0]) / 3600 : null;
-  const gaps = sorted.slice(1).map((t, i) => t - sorted[i]).sort((a, b) => a - b);
-  const medianGapSec = gaps.length ? gaps[Math.floor(gaps.length / 2)] : null;
-  const windowSeconds = spanHours === null ? null : Math.round(spanHours * 3600);
-  // Extrapolating a few seconds or minutes of activity to a daily rate gives absurd numbers.
-  const windowTooShort = windowSeconds !== null && windowSeconds < MIN_RATE_WINDOW_SEC;
-  const rateOk = spanHours !== null && spanHours > 0 && !windowTooShort;
-  return {
-    windowHours: spanHours === null ? null : Math.round(spanHours * 10) / 10,
-    windowSeconds,
-    windowTooShort,
-    swapsPerDay: rateOk ? Math.round((swaps / spanHours!) * 24 * 10) / 10 : null,
-    txsPerDay: rateOk ? Math.round((sorted.length / spanHours!) * 24 * 10) / 10 : null,
-    medianSecondsBetweenTxs: medianGapSec,
-  };
-}
-
-export async function buildWalletPreview(env: AppEnv, address: string) {
-  const [lamports, sigs] = await Promise.all([
-    rpc<{ value: number } | number>(env.solanaRpcUrl, "getBalance", [address]),
-    rpc<Array<{ blockTime: number | null }>>(env.solanaRpcUrl, "getSignaturesForAddress", [address, { limit: 25 }]),
-  ]);
-  const raw = typeof lamports === "number" ? lamports : lamports?.value ?? 0;
-  const last = sigs?.[0]?.blockTime ?? null;
-  const recent24 = (sigs ?? []).filter((x) => x.blockTime && Date.now() / 1000 - x.blockTime < 86_400).length;
-  return {
-    address,
-    asOf: new Date().toISOString(),
-    solBalance: raw / 1_000_000_000,
-    lastActiveAt: last ? new Date(last * 1000).toISOString() : null,
-    recentTxs24h: recent24,
-    recentTxs24hCapped: recent24 >= 25,
-    preview: true,
-    upgrade: "$0.002 at /wallet/quick for realized PnL, win rate, bot and smart-money flags; $0.01 at /wallet/profile for priced holdings and the full report.",
+    warnings: warnings.map((warning) => redactSecrets(warning)),
   };
 }

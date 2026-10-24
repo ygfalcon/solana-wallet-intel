@@ -1,0 +1,24 @@
+# Solana Wallet x402
+
+> Pay-per-call Solana wallet intelligence. Agents pay USDC over x402 on Solana or Base. An unpaid call returns HTTP 402. accepts[].amount is USDC base units (6 decimals).
+
+## Paid
+
+- [Solana wallet profile](https://solana-wallet-intel-phi.vercel.app/wallet/profile): $0.01 USDC (10000 base units). Holdings valued in USD, a short plain-language summary, windowed realized and unrealized PnL, win rate, and evidence-backed labels such as active memecoin trader. Required query: address. Optional query: txLimit. MCP tool `wallet_profile`.
+- [Trending Solana tokens](https://solana-wallet-intel-phi.vercel.app/token/trending): $0.005 USDC (5000 base units). Trending Solana tokens with liquidity, 24h volume, pair age, and a short summary. Each token includes holder concentration (top-10 share), mint and freeze authority, LP lock or burn status, and sniper or bundle share of early supply. Risky results are plain-English risk flags. Thin, new, and wash-like books are ranked down. No required query. Optional query: limit. MCP tool `token_trending`.
+- [Wallet funding source and cluster](https://solana-wallet-intel-phi.vercel.app/wallet/funding): $0.02 USDC (20000 base units). Find a wallet's first SOL funder, flag wallets that share that funder or a CEX deposit address, and return a cluster id with plain-language sybil risk reasons. Labeled exchange hot wallets are not used as a cluster. Optional peers compares up to 8 other wallets. Required query: address. Optional query: peers. MCP tool `wallet_funding`.
+- [Solana wallet quick screen](https://solana-wallet-intel-phi.vercel.app/wallet/quick): $0.002 USDC (2000 base units). Cheap copy-trade screen for one wallet: windowed realized PnL, win rate, closed trades, last active time, and bot, exchange, net-winner and dormant flags. Free teaser at /wallet/preview; full report at /wallet/profile. Required query: address. MCP tool `wallet_quick`.
+
+## Free
+
+- [Wallet preview](https://solana-wallet-intel-phi.vercel.app/wallet/preview): free SOL balance, last active time and 24h transaction count. Required query: address. No payment.
+- [Health](https://solana-wallet-intel-phi.vercel.app/health): free freshness and SLA. Reports version, p50 and p95 latency over a rolling window, upstream RPC rate-limit status, and cache age. No payment. The same sla object is on /.well-known/x402.
+- [OpenAPI](https://solana-wallet-intel-phi.vercel.app/openapi.json): machine-readable API with x-payment-info on paid routes and the health SLA schema.
+- [x402 discovery](https://solana-wallet-intel-phi.vercel.app/.well-known/x402): prices, accepts, input schemas, facilitator URLs, and the live SLA snapshot.
+- [MCP](https://solana-wallet-intel-phi.vercel.app/mcp): tools `wallet_profile`, `token_trending`, `wallet_funding`, `wallet_quick`, plus free `ping`.
+
+## Pricing note
+
+GET /token/trending costs $0.005 (5000 base units). That price includes holder concentration (top-10 share), mint and freeze authority, LP lock or burn status, and sniper or bundle share of early supply. Each risky result is a plain-English risk flag. The checks are read from free public Solana RPCs. When a check cannot be read, the response says so.
+
+Pay with an x402 client (PAYMENT-SIGNATURE) or the official MCP payment wrapper. Settlement is cancelled when the route returns a non-2xx error.

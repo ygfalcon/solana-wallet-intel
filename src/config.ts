@@ -64,9 +64,9 @@ export type AppEnv = {
   birdeyeApiKey?: string;
   solanaRpcUrl: string;
   priceWalletProfile: string;
-  priceWalletQuick: string;
-  priceWalletQuickBatch: string;
   priceTokenTrending: string;
+  priceWalletFunding: string;
+  priceWalletQuick: string;
 };
 
 function trimmed(value: string | undefined): string | undefined {
@@ -141,8 +141,8 @@ export function loadEnv(source: NodeJS.ProcessEnv = process.env): AppEnv {
     birdeyeApiKey: trimmed(source.BIRDEYE_API_KEY),
     solanaRpcUrl: trimmed(source.SOLANA_RPC_URL) ?? defaultRpc,
     priceWalletProfile: trimmed(source.PRICE_WALLET_PROFILE) ?? "$0.01",
-    priceWalletQuick: trimmed(source.PRICE_WALLET_QUICK) ?? "$0.002",
-    priceWalletQuickBatch: trimmed(source.PRICE_WALLET_QUICK_BATCH) ?? "$0.015",
     priceTokenTrending: trimmed(source.PRICE_TOKEN_TRENDING) ?? "$0.005",
+    priceWalletFunding: trimmed(source.PRICE_WALLET_FUNDING) ?? "$0.02",
+    priceWalletQuick: trimmed(source.PRICE_WALLET_QUICK) ?? "$0.002",
   };
 }

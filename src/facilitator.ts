@@ -4,13 +4,11 @@ import type { PaymentPayload, PaymentRequirements, SettleResponse, SupportedResp
 import type { AppEnv } from "./config.js";
 
 /**
- * Sends Solana and Base payments to the public PayAI facilitator. If Coinbase
- * CDP API keys are configured, Base payments go to the CDP facilitator instead.
+ * Sends Solana payments to the public facilitator and Base payments to the
+ * Coinbase CDP facilitator when CDP API keys are configured.
  * Earlier x402 clients keep the first facilitator that advertises a network,
  * which would hide Base from CDP whenever the public facilitator also lists it.
  */
-const PAYAI_FEE_PAYER = process.env.PAYAI_FEE_PAYER ?? "CjNFTjvBhbJJd2B5ePPMHRLx1ELZpa8dwQgGL727eKww";
-
 export class RoutingFacilitatorClient implements FacilitatorClient {
   constructor(
     private readonly solana: FacilitatorClient,
@@ -34,36 +32,8 @@ export class RoutingFacilitatorClient implements FacilitatorClient {
     return this.clientFor(paymentRequirements.network).settle(paymentPayload, paymentRequirements);
   }
 
-  private lastGood: SupportedResponse | null = null;
-
-  private async solanaSupportedResilient(): Promise<SupportedResponse> {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const result = await Promise.race([
-          this.solana.getSupported(),
-          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("supported timeout")), 6_000)),
-        ]);
-        this.lastGood = result;
-        return result;
-      } catch (error) {
-        console.warn(`facilitator /supported attempt ${attempt + 1} failed: ${error instanceof Error ? error.message : error}`);
-      }
-    }
-    if (this.lastGood) return this.lastGood;
-    // Static PayAI snapshot so a slow /supported never takes paid routes down.
-    return {
-      kinds: [
-        { x402Version: 2, scheme: "exact", network: this.solanaNetwork as never, extra: { feePayer: PAYAI_FEE_PAYER } },
-        // PayAI settles Base USDC (eip155:8453 / 84532) for x402 v2 without Coinbase CDP keys.
-        ...(this.baseNetwork ? [{ x402Version: 2, scheme: "exact", network: this.baseNetwork as never }] : []),
-      ],
-      extensions: ["bazaar"],
-      signers: { "solana:*": [PAYAI_FEE_PAYER] },
-    };
-  }
-
   async getSupported(): Promise<SupportedResponse> {
-    const solanaSupported = await this.solanaSupportedResilient();
+    const solanaSupported = await this.solana.getSupported();
     const baseSupported =
       this.base && this.base !== this.solana ? await this.base.getSupported().catch(() => null) : null;
 

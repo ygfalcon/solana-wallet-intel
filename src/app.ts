@@ -11,31 +11,48 @@ import { ExactSvmScheme } from "@x402/svm/exact/server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { z } from "zod";
-import { timingSafeEqual, createHash } from "node:crypto";
 import { enabledAccepts, operationForPath, paidOperations, type PaidOperation } from "./catalog.js";
 import { createCache } from "./cache.js";
 import { loadEnv, type AppEnv, type ChainAccept } from "./config.js";
 import { createFacilitator } from "./facilitator.js";
-import { UpstreamError } from "./http.js";
+import { parsePeerList } from "./funding.js";
+import { redactSecrets, UpstreamError } from "./http.js";
+import { buildLlmsTxt, trendingPricingNote } from "./llms.js";
+import { createSlaTracker, runWithSla, type SlaSnapshot } from "./sla.js";
 import { buildOpenApi } from "./openapi.js";
 import { isSolanaAddress } from "./solana.js";
-import { buildWalletProfile, buildWalletPreview, type WalletProfile, type HistoryOptions } from "./services/wallet.js";
+import { loadWalletFunding, type WalletFunding } from "./services/funding.js";
+import { buildWalletProfile, type WalletProfile } from "./services/wallet.js";
+import { buildWalletPreview } from "./services/preview.js";
 import { loadTrending, type TrendingResponse } from "./services/trending.js";
 
-type WalletLoader = (env: AppEnv, address: string, txLimit: number, opts?: HistoryOptions) => Promise<Omit<WalletProfile, "cached" | "stale">>;
+type WalletLoader = (env: AppEnv, address: string, txLimit: number) => Promise<Omit<WalletProfile, "cached" | "stale">>;
 type TrendingLoader = (env: AppEnv, limit: number) => Promise<Omit<TrendingResponse, "cached" | "stale">>;
+type PreviewLoader = (env: AppEnv, address: string) => Promise<unknown>;
+type FundingLoader = (env: AppEnv, address: string, peers: string[]) => Promise<Omit<WalletFunding, "cached" | "stale">>;
 
 export type CreateAppOptions = {
   env?: AppEnv;
   facilitator?: FacilitatorClient;
   walletProfile?: WalletLoader;
   trending?: TrendingLoader;
+  funding?: FundingLoader;
+  preview?: PreviewLoader;
 };
 
 function originFrom(env: AppEnv, requestUrl: string): string {
   if (env.publicBaseUrl) return env.publicBaseUrl.replace(/\/$/, "");
   const url = new URL(requestUrl);
   return url.origin;
+}
+
+function publicFailure(error: unknown, fallback: string): { status: 502 | 500; body: { error: string; message: string; retryable: boolean } } {
+  const raw = error instanceof Error ? error.message : "";
+  if (raw) console.error(redactSecrets(raw));
+  if (error instanceof UpstreamError) {
+    return { status: 502, body: { error: "upstream_failed", message: redactSecrets(error.message), retryable: true } };
+  }
+  return { status: 500, body: { error: "lookup_failed", message: fallback, retryable: false } };
 }
 
 function clampInt(value: string | undefined, fallback: number, min: number, max: number): number | null {
@@ -46,7 +63,13 @@ function clampInt(value: string | undefined, fallback: number, min: number, max:
   return parsed;
 }
 
-function discoveryDocument(env: AppEnv, operations: PaidOperation[], accepts: ChainAccept[], origin: string) {
+function discoveryDocument(
+  env: AppEnv,
+  operations: PaidOperation[],
+  accepts: ChainAccept[],
+  origin: string,
+  sla: SlaSnapshot,
+) {
   return {
     protocol: "x402",
     version: 2,
@@ -74,7 +97,7 @@ function discoveryDocument(env: AppEnv, operations: PaidOperation[], accepts: Ch
           }
         : {
             advertised: false,
-            reason: "Set EVM_PAY_TO to accept USDC on Base. Base settles through the public PayAI facilitator; no Coinbase CDP keys are needed.",
+            reason: "Set EVM_PAY_TO. Base settlements use the Coinbase CDP facilitator when CDP_API_KEY_ID and CDP_API_KEY_SECRET are set.",
           },
     },
     resources: operations.map((operation) => ({
@@ -112,6 +135,12 @@ function discoveryDocument(env: AppEnv, operations: PaidOperation[], accepts: Ch
       })),
     },
     openapi: `${origin}/openapi.json`,
+    llms: `${origin}/llms.txt`,
+    health: `${origin}/health`,
+    sla,
+    pricingNotes: [trendingPricingNote(operations.find((operation) => operation.id === "token_trending"))].filter(
+      (note) => note != null,
+    ),
   };
 }
 
@@ -140,8 +169,11 @@ export async function createApp(options: CreateAppOptions = {}) {
   const accepts = enabledAccepts(env, supported);
   const activeAccepts = accepts.length > 0 ? accepts : [env.solana];
   const cache = createCache();
+  const sla = createSlaTracker();
   const loadWallet = options.walletProfile ?? buildWalletProfile;
   const loadTrendingTokens = options.trending ?? loadTrending;
+  const loadFunding = options.funding ?? loadWalletFunding;
+  const loadPreview = options.preview ?? buildWalletPreview;
 
   const routes: Record<string, {
     accepts: Array<{ scheme: "exact"; price: string; network: string; payTo: string; maxTimeoutSeconds: number }>;
@@ -177,6 +209,13 @@ export async function createApp(options: CreateAppOptions = {}) {
   }
 
   const app = new Hono();
+  app.use("*", async (c, next) => {
+    const started = Date.now();
+    await runWithSla(sla, async () => {
+      await next();
+    });
+    if (new URL(c.req.url).pathname !== "/health") sla.recordLatency(Date.now() - started);
+  });
   app.use("*", cors());
   app.use("*", async (c, next) => {
     await next();
@@ -201,16 +240,9 @@ export async function createApp(options: CreateAppOptions = {}) {
   // Reject malformed input before asking for payment, so buyers never pay for a 400.
   app.use("*", async (c, next) => {
     const path = new URL(c.req.url).pathname;
-    if (path === "/wallet/profile" || path === "/wallet/quick") {
-      const a = c.req.query("address");
-      if (a !== undefined && !isSolanaAddress(a)) return c.json({ error: "invalid_address", message: "Query address must be a Solana base58 public key. You were not charged." }, 400);
-    }
-    if (path === "/wallet/quick/batch") {
-      const raw = c.req.query("addresses");
-      if (raw !== undefined) {
-        const list = raw.split(",").map((x) => x.trim()).filter(Boolean);
-        if (list.length < 1 || list.length > 10 || !list.every(isSolanaAddress)) return c.json({ error: "invalid_addresses", message: "addresses must be 1 to 10 comma-separated base58 Solana addresses. You were not charged." }, 400);
-      }
+    if (path === "/wallet/profile" || path === "/wallet/quick" || path === "/wallet/funding") {
+      const a = c.req.query("address")?.trim() ?? "";
+      if (!isSolanaAddress(a)) return c.json({ error: "invalid_address", message: "Query address must be a Solana base58 public key. You were not charged.", retryable: false }, 400);
     }
     await next();
   });
@@ -221,9 +253,7 @@ export async function createApp(options: CreateAppOptions = {}) {
     const origin = originFrom(env, c.req.url);
     return c.json({
       service: "solana-wallet-x402",
-      description: "Pay-per-call Solana wallet intel for agents. $0.002 USDC gets a quick screen (realized PnL, win rate, bot and smart-money flags; batch 10 for $0.015). Free /wallet/preview. $0.01 USDC gets a wallet's priced holdings, realized/unrealized PnL (cost basis at historical hourly SOL prices) with per-token breakdown, a 0-100 copy-trade score with explained components, win rate, trading cadence and labels (smart-money candidate, bot-like cadence, memecoin trader). $0.005 gets trending Solana tokens with liquidity, volume, age and rug-risk flags. No signup, no API key: x402 v2 on Solana mainnet.",
-      pricing: { "/wallet/quick": "$0.002", "/wallet/quick/batch": "$0.015 (up to 10 wallets)", "/wallet/profile": "$0.01", "/token/trending": "$0.005", "/wallet/preview": "free" },
-      quickstart: "npm i @x402/fetch @x402/svm @solana/kit; const f = wrapFetchWithPayment(fetch, client); await (await f(`${origin}/wallet/profile?address=<wallet>`)).json()",
+      description: "Pay per call in USDC for a Solana wallet profile or the current trending-token list.",
       networkMode: env.networkMode,
       payTo: { solana: env.solanaPayTo, base: env.evmPayTo ?? null },
       endpoints: {
@@ -231,11 +261,12 @@ export async function createApp(options: CreateAppOptions = {}) {
         openapi: `${origin}/openapi.json`,
         discovery: `${origin}/.well-known/x402`,
         mcp: `${origin}/mcp`,
-        walletPreview: `${origin}/wallet/preview?address=<base58>  (free: SOL balance + last active)`,
-        walletQuick: `${origin}/wallet/quick?address=<base58>`,
-        walletQuickBatch: `${origin}/wallet/quick/batch?addresses=<a>,<b>,...`,
         walletProfile: `${origin}/wallet/profile`,
+        walletQuick: `${origin}/wallet/quick`,
+        walletPreview: `${origin}/wallet/preview`,
+        walletFunding: `${origin}/wallet/funding`,
         trending: `${origin}/token/trending`,
+        llms: `${origin}/llms.txt`,
       },
     });
   });
@@ -251,109 +282,126 @@ export async function createApp(options: CreateAppOptions = {}) {
         network: accept.network,
         facilitator: accept.facilitator,
       })),
+      sla: sla.snapshot(cache.stats()),
     }),
   );
 
   app.get("/openapi.json", (c) => c.json(buildOpenApi(env, operations, activeAccepts, originFrom(env, c.req.url))));
-  app.get("/.well-known/x402", (c) => c.json(discoveryDocument(env, operations, activeAccepts, originFrom(env, c.req.url))));
+  app.get("/.well-known/x402", (c) =>
+    c.json(discoveryDocument(env, operations, activeAccepts, originFrom(env, c.req.url), sla.snapshot(cache.stats()))),
+  );
+  app.get("/llms.txt", (c) => c.text(buildLlmsTxt(originFrom(env, c.req.url), operations)));
 
-  function quickOf(p: any) {
-    const labels: string[] = p.labels ?? [];
+  function quickOf(p: Omit<WalletProfile, "cached" | "stale">) {
+    const labels = p.labels ?? [];
     return {
       address: p.address,
+      asOf: p.asOf,
       realizedUsd: p.pnl?.realizedUsd ?? null,
       winRate: p.pnl?.winRate ?? null,
       closedTrades: p.pnl?.closedTrades ?? 0,
-      swapsPerDay: p.trading?.swapsPerDay ?? null,
-      txsPerDay: p.trading?.txsPerDay ?? null,
-      windowSeconds: p.trading?.windowSeconds ?? null,
-      windowTooShort: p.trading?.windowTooShort ?? false,
-      exchangeLike: labels.includes("exchange or custodial wallet"),
-      bot: labels.includes("bot-like cadence"),
-      smartMoney: labels.includes("smart-money candidate"),
+      exchangeLike: labels.some((l) => /exchange|custodial/i.test(l)),
+      bot: labels.some((l) => /bot/i.test(l)),
+      smartMoney: labels.some((l) => /smart/i.test(l)),
       netWinner: labels.includes("net winner"),
       dormant: labels.includes("dormant"),
       portfolioUsd: p.portfolioUsd ?? null,
       lastActiveAt: p.activity?.lastActiveAt ?? null,
       windowTransactions: p.window?.transactions ?? null,
-      copyTradeScore: p.copyTradeScore?.score ?? null,
-      copyTradeGrade: p.copyTradeScore?.grade ?? null,
-      pnlMethod: p.pnl?.method ?? null,
+      labels,
+      summary: p.summary,
     };
   }
-  const profile50 = (address: string) =>
-    cache.getOrSet(`quick:${env.walletCluster}:${address}`, 60_000, () =>
-      loadWallet(env, address, 50, { minWindowSec: 86_400, maxTxs: 300, budgetMs: 3_500 }));
-  async function quickBatch(raw: string) {
-    const list = [...new Set(raw.split(",").map((a) => a.trim()).filter(Boolean))];
-    if (list.length === 0 || list.length > 10 || !list.every(isSolanaAddress)) return null;
-    const wallets: ReturnType<typeof quickOf>[] = [];
-    const errors: Array<{ address: string; error: string }> = [];
-    await Promise.all(list.map(async (a) => {
-      try { wallets.push(quickOf((await profile50(a)).value)); }
-      catch (e) { errors.push({ address: a, error: e instanceof Error ? e.message : "lookup failed" }); }
-    }));
-    wallets.sort((x, y) => (y.realizedUsd ?? -1e12) - (x.realizedUsd ?? -1e12));
-    return { asOf: new Date().toISOString(), wallets, errors };
-  }
+  const quickLoad = (address: string) =>
+    cache.getOrSet(`wallet:${env.walletCluster}:${address}:25`, 60_000, () => loadWallet(env, address, 25));
 
   app.get("/wallet/quick", async (c) => {
     const address = c.req.query("address")?.trim() ?? "";
-    if (!isSolanaAddress(address)) return c.json({ error: "invalid_address", message: "Query address must be a Solana base58 public key." }, 400);
-    try { return c.json(quickOf((await profile50(address)).value)); }
-    catch (error) { return c.json({ error: "upstream_failed", message: error instanceof Error ? error.message : "lookup failed" }, 502); }
-  });
-
-  app.get("/wallet/quick/batch", async (c) => {
-    const out = await quickBatch(c.req.query("addresses") ?? "");
-    if (!out) return c.json({ error: "invalid_addresses", message: "addresses must be 1 to 10 comma-separated base58 Solana addresses." }, 400);
-    return c.json(out);
+    if (!isSolanaAddress(address)) {
+      return c.json({ error: "invalid_address", message: "Query address must be a Solana base58 public key.", retryable: false }, 400);
+    }
+    try {
+      const hit = await quickLoad(address);
+      return c.json({ ...quickOf(hit.value), cached: hit.cached, stale: hit.stale });
+    } catch (error) {
+      const failure = publicFailure(error, "Wallet lookup failed");
+      return c.json(failure.body, failure.status);
+    }
   });
 
   app.get("/wallet/preview", async (c) => {
     const address = c.req.query("address")?.trim() ?? "";
     if (!isSolanaAddress(address)) {
-      return c.json({ error: "invalid_address", message: "Query address must be a Solana base58 public key." }, 400);
+      return c.json({ error: "invalid_address", message: "Query address must be a Solana base58 public key.", retryable: false }, 400);
     }
     try {
-      const hit = await cache.getOrSet(`preview:${address}`, 30_000, () => buildWalletPreview(env, address));
-      return c.json(hit.value);
+      const hit = await cache.getOrSet(`preview:${env.walletCluster}:${address}`, 30_000, () => loadPreview(env, address));
+      return c.json(hit.value as Record<string, unknown>);
     } catch (error) {
-      return c.json({ error: "upstream_failed", message: error instanceof Error ? error.message : "lookup failed" }, 502);
+      const failure = publicFailure(error, "Wallet preview failed");
+      return c.json(failure.body, failure.status);
     }
   });
 
   app.get("/wallet/profile", async (c) => {
     const address = c.req.query("address")?.trim() ?? "";
     if (!isSolanaAddress(address)) {
-      return c.json({ error: "invalid_address", message: "Query address must be a Solana base58 public key." }, 400);
+      return c.json(
+        { error: "invalid_address", message: "Query address must be a Solana base58 public key.", retryable: false },
+        400,
+      );
     }
-    const txLimit = clampInt(c.req.query("txLimit"), 100, 5, 300);
-    if (txLimit === null) return c.json({ error: "invalid_tx_limit", message: "txLimit must be an integer from 5 to 300." }, 400);
+    const txLimit = clampInt(c.req.query("txLimit"), 20, 5, 25);
+    if (txLimit === null) {
+      return c.json({ error: "invalid_tx_limit", message: "txLimit must be an integer from 5 to 25.", retryable: false }, 400);
+    }
     try {
       const hit = await cache.getOrSet(`wallet:${env.walletCluster}:${address}:${txLimit}`, 60_000, () =>
         loadWallet(env, address, txLimit),
       );
       return c.json({ ...hit.value, cached: hit.cached, stale: hit.stale });
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Wallet lookup failed";
-      const status = error instanceof UpstreamError ? 502 : 500;
-      return c.json({ error: "upstream_failed", message }, status);
+      const failure = publicFailure(error, "Wallet lookup failed");
+      return c.json(failure.body, failure.status);
+    }
+  });
+
+  app.get("/wallet/funding", async (c) => {
+    const address = c.req.query("address")?.trim() ?? "";
+    if (!isSolanaAddress(address)) {
+      return c.json(
+        { error: "invalid_address", message: "Query address must be a Solana base58 public key.", retryable: false },
+        400,
+      );
+    }
+    const peers = parsePeerList(c.req.query("peers"), address);
+    if ("error" in peers) {
+      return c.json({ error: "invalid_peers", message: peers.error, retryable: false }, 400);
+    }
+    try {
+      const hit = await cache.getOrSet(`funding:${env.walletCluster}:${address}:${peers.peers.join(",")}`, 60_000, () =>
+        loadFunding(env, address, peers.peers),
+      );
+      return c.json({ ...hit.value, cached: hit.cached, stale: hit.stale });
+    } catch (error) {
+      const failure = publicFailure(error, "Funding lookup failed");
+      return c.json(failure.body, failure.status);
     }
   });
 
   app.get("/token/trending", async (c) => {
     const limit = clampInt(c.req.query("limit"), 15, 1, 25);
-    if (limit === null) return c.json({ error: "invalid_limit", message: "limit must be an integer from 1 to 25." }, 400);
+    if (limit === null) {
+      return c.json({ error: "invalid_limit", message: "limit must be an integer from 1 to 25.", retryable: false }, 400);
+    }
     try {
       const hit = await cache.getOrSet(`trending:${limit}:${Boolean(env.birdeyeApiKey)}`, 60_000, () =>
         loadTrendingTokens(env, limit),
       );
       return c.json({ ...hit.value, cached: hit.cached, stale: hit.stale });
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Trending lookup failed";
-      const status = error instanceof UpstreamError ? 502 : 500;
-      return c.json({ error: "upstream_failed", message }, status);
+      const failure = publicFailure(error, "Trending lookup failed");
+      return c.json(failure.body, failure.status);
     }
   });
 
@@ -394,94 +442,122 @@ export async function createApp(options: CreateAppOptions = {}) {
   }
 
   app.all("/mcp", async (c) => {
+    // Stateless server: no standalone SSE stream. Open GETs otherwise hang until the 300s function timeout.
+    if (c.req.method === "GET") return c.json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed. POST JSON-RPC to /mcp." }, id: null }, 405, { Allow: "POST" });
     const mcp = new McpServer({ name: "solana-wallet-x402", version: "1.0.0" });
     mcp.tool("ping", "Free health check. Does not spend USDC.", {}, async () => ({
       content: [{ type: "text", text: "pong" }],
     }));
 
-    mcp.tool(
-      "wallet_preview",
-      "Free Solana wallet teaser: SOL balance, last active time and 24h transaction count. Does not spend USDC. Use wallet_quick ($0.002) for PnL, win rate and bot/smart-money flags.",
-      { address: z.string().describe("Solana wallet address (base58)") },
-      async ({ address }: { address: string }) => {
-        if (!isSolanaAddress(address)) return { isError: true, content: [{ type: "text" as const, text: "Invalid Solana address." }] };
-        try {
-          const hit = await cache.getOrSet(`preview:${address}`, 30_000, () => buildWalletPreview(env, address));
-          return { content: [{ type: "text" as const, text: JSON.stringify(hit.value) }] };
-        } catch (e) {
-          return { isError: true, content: [{ type: "text" as const, text: e instanceof Error ? e.message : "lookup failed" }] };
-        }
-      },
-    );
+    const walletOp = operations.find((operation) => operation.id === "wallet_profile");
+    const trendingOp = operations.find((operation) => operation.id === "token_trending");
+    const fundingOp = operations.find((operation) => operation.id === "wallet_funding");
+    if (!walletOp || !trendingOp || !fundingOp) throw new Error("paid catalog is missing a tool");
 
-    const walletPaid = await wrapperFor(operations[0]).catch(() => null);
+    const unpaidTool = async () => ({
+      isError: true,
+      content: [{ type: "text" as const, text: "Payment facilitator is unavailable, so this tool is not priced yet." }],
+    });
+
+    const walletPaid = await wrapperFor(walletOp).catch(() => null);
     const walletHandler = walletPaid
       ? walletPaid(async ({ address }: { address: string }) => {
           if (!isSolanaAddress(address)) {
             return { isError: true, content: [{ type: "text" as const, text: "Query address must be a Solana base58 public key." }] };
           }
-          const hit = await cache.getOrSet(`wallet:${env.walletCluster}:${address}:50`, 60_000, () => loadWallet(env, address, 50));
-          return { content: [{ type: "text" as const, text: JSON.stringify({ ...hit.value, cached: hit.cached, stale: hit.stale }) }] };
+          try {
+            const hit = await cache.getOrSet(`wallet:${env.walletCluster}:${address}:20`, 60_000, () => loadWallet(env, address, 20));
+            return { content: [{ type: "text" as const, text: JSON.stringify({ ...hit.value, cached: hit.cached, stale: hit.stale }) }] };
+          } catch (error) {
+            const failure = publicFailure(error, "Wallet lookup failed");
+            return { isError: true, content: [{ type: "text" as const, text: JSON.stringify(failure.body) }] };
+          }
         })
-      : async () => ({
-          isError: true,
-          content: [{ type: "text" as const, text: "Payment facilitator is unavailable, so this tool is not priced yet." }],
-        });
+      : unpaidTool;
     mcp.tool(
-      "wallet_profile",
-      `${operations[0].description} Costs ${operations[0].price} USDC.`,
-      { address: z.string().describe("Solana wallet address (base58)") },
+      walletOp.mcpTool,
+      `${walletOp.description} Costs ${walletOp.price} USDC.`,
+      { address: z.string().describe("Solana wallet address") },
       walletHandler,
     );
 
-    const trendingPaid = await wrapperFor(operations[1]).catch(() => null);
+    const trendingPaid = await wrapperFor(trendingOp).catch(() => null);
     const trendingHandler = trendingPaid
-      ? trendingPaid(async ({ limit }: { limit?: number }) => {
-          const parsed = clampInt(limit === undefined ? undefined : String(limit), 15, 1, 25);
+      ? trendingPaid(async ({ limit }: { limit?: string }) => {
+          const parsed = clampInt(limit, 15, 1, 25);
           if (parsed === null) {
             return { isError: true, content: [{ type: "text" as const, text: "limit must be an integer from 1 to 25." }] };
           }
-          const hit = await cache.getOrSet(`trending:${parsed}:${Boolean(env.birdeyeApiKey)}`, 60_000, () =>
-            loadTrendingTokens(env, parsed),
-          );
-          return { content: [{ type: "text" as const, text: JSON.stringify({ ...hit.value, cached: hit.cached, stale: hit.stale }) }] };
+          try {
+            const hit = await cache.getOrSet(`trending:${parsed}:${Boolean(env.birdeyeApiKey)}`, 60_000, () =>
+              loadTrendingTokens(env, parsed),
+            );
+            return { content: [{ type: "text" as const, text: JSON.stringify({ ...hit.value, cached: hit.cached, stale: hit.stale }) }] };
+          } catch (error) {
+            const failure = publicFailure(error, "Trending lookup failed");
+            return { isError: true, content: [{ type: "text" as const, text: JSON.stringify(failure.body) }] };
+          }
         })
-      : async () => ({
-          isError: true,
-          content: [{ type: "text" as const, text: "Payment facilitator is unavailable, so this tool is not priced yet." }],
-        });
+      : unpaidTool;
     mcp.tool(
-      "token_trending",
-      `${operations[1].description} Costs ${operations[1].price} USDC.`,
-      { limit: z.number().int().min(1).max(25).optional().describe("1 to 25, default 15") },
+      trendingOp.mcpTool,
+      `${trendingOp.description} Costs ${trendingOp.price} USDC.`,
+      { limit: z.string().optional().describe("1 to 25, default 15") },
       trendingHandler,
     );
 
-    const quickPaid = await wrapperFor(operations[2]).catch(() => null);
+    const fundingPaid = await wrapperFor(fundingOp).catch(() => null);
+    const fundingHandler = fundingPaid
+      ? fundingPaid(async ({ address, peers }: { address: string; peers?: string }) => {
+          if (!isSolanaAddress(address)) {
+            return { isError: true, content: [{ type: "text" as const, text: "Query address must be a Solana base58 public key." }] };
+          }
+          const parsed = parsePeerList(peers, address);
+          if ("error" in parsed) {
+            return { isError: true, content: [{ type: "text" as const, text: parsed.error }] };
+          }
+          try {
+            const hit = await cache.getOrSet(
+              `funding:${env.walletCluster}:${address}:${parsed.peers.join(",")}`,
+              60_000,
+              () => loadFunding(env, address, parsed.peers),
+            );
+            return { content: [{ type: "text" as const, text: JSON.stringify({ ...hit.value, cached: hit.cached, stale: hit.stale }) }] };
+          } catch (error) {
+            const failure = publicFailure(error, "Funding lookup failed");
+            return { isError: true, content: [{ type: "text" as const, text: JSON.stringify(failure.body) }] };
+          }
+        })
+      : unpaidTool;
     mcp.tool(
-      "wallet_quick",
-      `${operations[2].description} Costs ${operations[2].price} USDC.`,
-      { address: z.string().describe("Solana wallet address (base58)") },
-      quickPaid
+      fundingOp.mcpTool,
+      `${fundingOp.description} Costs ${fundingOp.price} USDC.`,
+      {
+        address: z.string().describe("Solana wallet address"),
+        peers: z.string().optional().describe("Comma-separated peer wallets, up to 8"),
+      },
+      fundingHandler,
+    );
+
+    const quickOp = operations.find((operation) => operation.id === "wallet_quick");
+    if (quickOp) {
+      const quickPaid = await wrapperFor(quickOp).catch(() => null);
+      const quickHandler = quickPaid
         ? quickPaid(async ({ address }: { address: string }) => {
-            if (!isSolanaAddress(address)) return { isError: true, content: [{ type: "text" as const, text: "Invalid Solana address." }] };
-            return { content: [{ type: "text" as const, text: JSON.stringify(quickOf((await profile50(address)).value)) }] };
+            if (!isSolanaAddress(address)) {
+              return { isError: true, content: [{ type: "text" as const, text: "Query address must be a Solana base58 public key." }] };
+            }
+            try {
+              const hit = await quickLoad(address);
+              return { content: [{ type: "text" as const, text: JSON.stringify({ ...quickOf(hit.value), cached: hit.cached, stale: hit.stale }) }] };
+            } catch (error) {
+              const failure = publicFailure(error, "Wallet lookup failed");
+              return { isError: true, content: [{ type: "text" as const, text: JSON.stringify(failure.body) }] };
+            }
           })
-        : async () => ({ isError: true, content: [{ type: "text" as const, text: "Payment facilitator is unavailable." }] }),
-    );
-    const batchPaid = await wrapperFor(operations[3]).catch(() => null);
-    mcp.tool(
-      "wallet_quick_batch",
-      `${operations[3].description} Costs ${operations[3].price} USDC.`,
-      { addresses: z.string().describe("Up to 10 comma-separated Solana addresses") },
-      batchPaid
-        ? batchPaid(async ({ addresses }: { addresses: string }) => {
-            const out = await quickBatch(addresses);
-            if (!out) return { isError: true, content: [{ type: "text" as const, text: "addresses must be 1 to 10 valid Solana addresses." }] };
-            return { content: [{ type: "text" as const, text: JSON.stringify(out) }] };
-          })
-        : async () => ({ isError: true, content: [{ type: "text" as const, text: "Payment facilitator is unavailable." }] }),
-    );
+        : unpaidTool;
+      mcp.tool(quickOp.mcpTool, `${quickOp.description} Costs ${quickOp.price} USDC.`, { address: z.string().describe("Solana wallet address") }, quickHandler);
+    }
 
     const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
@@ -490,71 +566,6 @@ export async function createApp(options: CreateAppOptions = {}) {
     await mcp.connect(transport);
     return transport.handleRequest(c.req.raw);
   });
-
-  // Partner channels (Apify Actor, RapidAPI). Same handlers as the x402 routes, but
-  // authenticated by a server-side shared secret instead of a per-call USDC payment.
-  // Secrets live only in Vercel env vars; a missing or placeholder value disables the channel.
-  function secretOk(expected: string | undefined, given: string | undefined): boolean {
-    if (!expected || /^placeholder/i.test(expected) || !given) return false;
-    const a = createHash("sha256").update(expected).digest();
-    const b = createHash("sha256").update(given).digest();
-    return timingSafeEqual(a, b);
-  }
-  const partners: Array<{ prefix: string; channel: string; header: string; secret: () => string | undefined }> = [
-    { prefix: "/internal/v1", channel: "apify", header: "x-swi-internal-key", secret: () => process.env.SWI_INTERNAL_KEY?.trim() },
-    { prefix: "/rapidapi/v1", channel: "rapidapi", header: "x-rapidapi-proxy-secret", secret: () => process.env.RAPIDAPI_PROXY_SECRET?.trim() },
-  ];
-  for (const partner of partners) {
-    app.use(`${partner.prefix}/*`, async (c, next) => {
-      const expected = partner.secret();
-      if (!expected || /^placeholder/i.test(expected)) return c.json({ error: "channel_disabled", message: `The ${partner.channel} channel is not configured.` }, 503);
-      if (!secretOk(expected, c.req.header(partner.header))) return c.json({ error: "unauthorized", message: `Missing or invalid ${partner.header} header.` }, 401);
-      await next();
-      c.header("x-swi-channel", partner.channel);
-      c.header("cache-control", "no-store");
-    });
-    const P = partner.prefix;
-    app.get(`${P}/health`, (c) => c.json({ ok: true, channel: partner.channel, dataCluster: env.walletCluster, asOf: new Date().toISOString() }));
-    app.get(`${P}/wallet/preview`, async (c) => {
-      const address = c.req.query("address")?.trim() ?? "";
-      if (!isSolanaAddress(address)) return c.json({ error: "invalid_address", message: "Query address must be a Solana base58 public key." }, 400);
-      try { return c.json((await cache.getOrSet(`preview:${address}`, 30_000, () => buildWalletPreview(env, address))).value); }
-      catch (error) { return c.json({ error: "upstream_failed", message: error instanceof Error ? error.message : "lookup failed" }, 502); }
-    });
-    app.get(`${P}/wallet/quick`, async (c) => {
-      const address = c.req.query("address")?.trim() ?? "";
-      if (!isSolanaAddress(address)) return c.json({ error: "invalid_address", message: "Query address must be a Solana base58 public key." }, 400);
-      try { return c.json(quickOf((await profile50(address)).value)); }
-      catch (error) { return c.json({ error: "upstream_failed", message: error instanceof Error ? error.message : "lookup failed" }, 502); }
-    });
-    app.get(`${P}/wallet/quick/batch`, async (c) => {
-      const out = await quickBatch(c.req.query("addresses") ?? "");
-      if (!out) return c.json({ error: "invalid_addresses", message: "addresses must be 1 to 10 comma-separated base58 Solana addresses." }, 400);
-      return c.json(out);
-    });
-    app.get(`${P}/wallet/profile`, async (c) => {
-      const address = c.req.query("address")?.trim() ?? "";
-      if (!isSolanaAddress(address)) return c.json({ error: "invalid_address", message: "Query address must be a Solana base58 public key." }, 400);
-      const txLimit = clampInt(c.req.query("txLimit"), 100, 5, 300);
-      if (txLimit === null) return c.json({ error: "invalid_tx_limit", message: "txLimit must be an integer from 5 to 300." }, 400);
-      try {
-        const hit = await cache.getOrSet(`wallet:${env.walletCluster}:${address}:${txLimit}`, 60_000, () => loadWallet(env, address, txLimit));
-        return c.json({ ...hit.value, cached: hit.cached, stale: hit.stale });
-      } catch (error) {
-        return c.json({ error: "upstream_failed", message: error instanceof Error ? error.message : "Wallet lookup failed" }, error instanceof UpstreamError ? 502 : 500);
-      }
-    });
-    app.get(`${P}/token/trending`, async (c) => {
-      const limit = clampInt(c.req.query("limit"), 15, 1, 25);
-      if (limit === null) return c.json({ error: "invalid_limit", message: "limit must be an integer from 1 to 25." }, 400);
-      try {
-        const hit = await cache.getOrSet(`trending:${limit}:${Boolean(env.birdeyeApiKey)}`, 60_000, () => loadTrendingTokens(env, limit));
-        return c.json({ ...hit.value, cached: hit.cached, stale: hit.stale });
-      } catch (error) {
-        return c.json({ error: "upstream_failed", message: error instanceof Error ? error.message : "Trending lookup failed" }, error instanceof UpstreamError ? 502 : 500);
-      }
-    });
-  }
 
   return { app, env, accepts: activeAccepts, operations };
 }
