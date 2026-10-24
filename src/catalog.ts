@@ -1,10 +1,10 @@
 import { usdToBaseUnits, type AppEnv, type ChainAccept } from "./config.js";
 
 export type PaidOperation = {
-  id: "wallet_profile" | "token_trending" | "wallet_funding" | "wallet_quick";
-  mcpTool: "wallet_profile" | "token_trending" | "wallet_funding" | "wallet_quick";
+  id: "wallet_profile" | "token_trending" | "wallet_funding" | "wallet_quick" | "wallet_quick_batch";
+  mcpTool: "wallet_profile" | "token_trending" | "wallet_funding" | "wallet_quick" | "wallet_quick_batch";
   method: "GET";
-  path: "/wallet/profile" | "/token/trending" | "/wallet/funding" | "/wallet/quick";
+  path: "/wallet/profile" | "/token/trending" | "/wallet/funding" | "/wallet/quick" | "/wallet/quick/batch";
   price: string;
   amount: string;
   summary: string;
@@ -194,6 +194,28 @@ export function paidOperations(env: AppEnv): PaidOperation[] {
         portfolioUsd: 1280.4,
         lastActiveAt: "2026-10-23T18:00:00.000Z",
         windowTransactions: 25,
+      },
+    },
+    {
+      id: "wallet_quick_batch",
+      mcpTool: "wallet_quick_batch",
+      method: "GET",
+      path: "/wallet/quick/batch",
+      price: env.priceWalletQuickBatch,
+      amount: usdToBaseUnits(env.priceWalletQuickBatch),
+      summary: "Batch quick screen, up to 10 wallets",
+      description:
+        "Quick screen (windowed realized PnL, win rate, bot, exchange, net-winner and dormant flags) for up to 10 Solana wallets in one paid call, ranked by realized PnL. Pass addresses comma-separated.",
+      inputSchema: {
+        type: "object",
+        properties: { addresses: { type: "string", description: "Up to 10 comma-separated base58 Solana wallet addresses." } },
+        required: ["addresses"],
+      },
+      example: { addresses: "HD1ryR3dYSXBVNGfJZydbpmnChiE1wrAQkupWWtHt4pM,suqh5sHtr8HyJ7q8scBimULPkPpA557prMG47xCHQfK" },
+      outputExample: {
+        asOf: "2026-10-24T12:00:00.000Z",
+        wallets: [{ address: "HD1ryR3dYSXBVNGfJZydbpmnChiE1wrAQkupWWtHt4pM", realizedUsd: 42.1, winRate: 0.6, bot: false, smartMoney: false }],
+        errors: [],
       },
     },
   ];

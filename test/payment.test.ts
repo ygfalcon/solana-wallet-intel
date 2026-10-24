@@ -160,7 +160,7 @@ describe("x402 paywall", () => {
 
     const discovery = await (await app.request("http://127.0.0.1:4021/.well-known/x402")).json();
     expect(discovery.protocol).toBe("x402");
-    expect(discovery.resources).toHaveLength(4);
+    expect(discovery.resources).toHaveLength(5);
     expect(discovery.resources[0].accepts[0].amount).toBe("10000");
     expect(discovery.resources.find((resource: { path: string }) => resource.path === "/token/trending").amount).toBe("5000");
     const funding = discovery.resources.find((resource: { path: string }) => resource.path === "/wallet/funding");

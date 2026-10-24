@@ -11,6 +11,7 @@ import { ExactSvmScheme } from "@x402/svm/exact/server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { z } from "zod";
+import { timingSafeEqual, createHash, randomBytes } from "node:crypto";
 import { enabledAccepts, operationForPath, paidOperations, type PaidOperation } from "./catalog.js";
 import { createCache } from "./cache.js";
 import { loadEnv, type AppEnv, type ChainAccept } from "./config.js";
@@ -53,6 +54,12 @@ function publicFailure(error: unknown, fallback: string): { status: 502 | 500; b
     return { status: 502, body: { error: "upstream_failed", message: redactSecrets(error.message), retryable: true } };
   }
   return { status: 500, body: { error: "lookup_failed", message: fallback, retryable: false } };
+}
+
+export function parseAddressList(raw: string | undefined, max = 10): string[] | null {
+  const list = [...new Set(String(raw ?? "").split(",").map((a) => a.trim()).filter(Boolean))];
+  if (list.length < 1 || list.length > max || !list.every(isSolanaAddress)) return null;
+  return list;
 }
 
 function clampInt(value: string | undefined, fallback: number, min: number, max: number): number | null {
@@ -208,6 +215,8 @@ export async function createApp(options: CreateAppOptions = {}) {
     };
   }
 
+  const PARTNER_MARKER = "x-swi-partner-dispatch";
+  const partnerToken = randomBytes(32).toString("hex");
   const app = new Hono();
   app.use("*", async (c, next) => {
     const started = Date.now();
@@ -244,10 +253,22 @@ export async function createApp(options: CreateAppOptions = {}) {
       const a = c.req.query("address")?.trim() ?? "";
       if (!isSolanaAddress(a)) return c.json({ error: "invalid_address", message: "Query address must be a Solana base58 public key. You were not charged.", retryable: false }, 400);
     }
+    if (path === "/wallet/quick/batch" && parseAddressList(c.req.query("addresses")) === null) {
+      return c.json({ error: "invalid_addresses", message: "addresses must be 1 to 10 comma-separated base58 Solana addresses. You were not charged.", retryable: false }, 400);
+    }
     await next();
   });
 
-  app.use("*", paymentMiddleware(routes as never, resourceServer));
+  // Partner channels re-dispatch internally with a per-process random token (never sent to clients),
+  // already authenticated by their shared secret, so they skip the x402 payment step.
+  const pay = paymentMiddleware(routes as never, resourceServer);
+  app.use("*", async (c, next) => {
+    const marker = c.req.header(PARTNER_MARKER);
+    if (marker && marker.length === partnerToken.length && timingSafeEqual(Buffer.from(marker), Buffer.from(partnerToken))) {
+      return next();
+    }
+    return pay(c, next);
+  });
 
   app.get("/", (c) => {
     const origin = originFrom(env, c.req.url);
@@ -263,6 +284,7 @@ export async function createApp(options: CreateAppOptions = {}) {
         mcp: `${origin}/mcp`,
         walletProfile: `${origin}/wallet/profile`,
         walletQuick: `${origin}/wallet/quick`,
+        walletQuickBatch: `${origin}/wallet/quick/batch`,
         walletPreview: `${origin}/wallet/preview`,
         walletFunding: `${origin}/wallet/funding`,
         trending: `${origin}/token/trending`,
@@ -314,6 +336,29 @@ export async function createApp(options: CreateAppOptions = {}) {
   }
   const quickLoad = (address: string) =>
     cache.getOrSet(`wallet:${env.walletCluster}:${address}:25`, 60_000, () => loadWallet(env, address, 25));
+
+  async function quickBatch(list: string[]) {
+    const wallets: Array<ReturnType<typeof quickOf> & { cached: boolean; stale: boolean }> = [];
+    const errors: Array<{ address: string; error: string; message: string; retryable: boolean }> = [];
+    await Promise.all(list.map(async (address) => {
+      try {
+        const hit = await quickLoad(address);
+        wallets.push({ ...quickOf(hit.value), cached: hit.cached, stale: hit.stale });
+      } catch (error) {
+        errors.push({ address, ...publicFailure(error, "Wallet lookup failed").body });
+      }
+    }));
+    wallets.sort((x, y) => (y.realizedUsd ?? -1e12) - (x.realizedUsd ?? -1e12));
+    return { asOf: new Date().toISOString(), wallets, errors };
+  }
+
+  app.get("/wallet/quick/batch", async (c) => {
+    const list = parseAddressList(c.req.query("addresses"));
+    if (!list) {
+      return c.json({ error: "invalid_addresses", message: "addresses must be 1 to 10 comma-separated base58 Solana addresses.", retryable: false }, 400);
+    }
+    return c.json(await quickBatch(list));
+  });
 
   app.get("/wallet/quick", async (c) => {
     const address = c.req.query("address")?.trim() ?? "";
@@ -566,6 +611,47 @@ export async function createApp(options: CreateAppOptions = {}) {
     await mcp.connect(transport);
     return transport.handleRequest(c.req.raw);
   });
+
+  // Partner channels (Apify Actor, RapidAPI): the same handlers as the x402 routes, authenticated by a
+  // server-side shared secret instead of a per-call USDC payment. A missing or placeholder secret disables it.
+  function secretOk(expected: string, given: string | undefined): boolean {
+    if (!given) return false;
+    const a = createHash("sha256").update(expected).digest();
+    const b = createHash("sha256").update(given).digest();
+    return timingSafeEqual(a, b);
+  }
+  const partners: Array<{ prefix: string; channel: string; header: string; secret: () => string | undefined }> = [
+    { prefix: "/internal/v1", channel: "apify", header: "x-swi-internal-key", secret: () => process.env.SWI_INTERNAL_KEY?.trim() },
+    { prefix: "/rapidapi/v1", channel: "rapidapi", header: "x-rapidapi-proxy-secret", secret: () => process.env.RAPIDAPI_PROXY_SECRET?.trim() },
+  ];
+  const partnerPaths = ["/wallet/preview", "/wallet/quick", "/wallet/quick/batch", "/wallet/profile", "/wallet/funding", "/token/trending"];
+  for (const partner of partners) {
+    app.use(`${partner.prefix}/*`, async (c, next) => {
+      const expected = partner.secret();
+      if (!expected || /^placeholder/i.test(expected)) {
+        return c.json({ error: "channel_disabled", message: `The ${partner.channel} channel is not configured.` }, 503);
+      }
+      if (!secretOk(expected, c.req.header(partner.header))) {
+        return c.json({ error: "unauthorized", message: `Missing or invalid ${partner.header} header.` }, 401);
+      }
+      await next();
+      c.header("x-swi-channel", partner.channel);
+      c.header("cache-control", "no-store");
+    });
+    app.get(`${partner.prefix}/health`, (c) =>
+      c.json({ ok: true, channel: partner.channel, dataCluster: env.walletCluster, asOf: new Date().toISOString() }),
+    );
+    for (const path of partnerPaths) {
+      // Re-dispatch to the public handler with the prefix stripped. The payment middleware is skipped
+      // because the inner request carries the partner marker header set only here.
+      app.get(`${partner.prefix}${path}`, async (c) => {
+        const url = new URL(c.req.url);
+        url.pathname = path;
+        const inner = new Request(url, { method: "GET", headers: { [PARTNER_MARKER]: partnerToken } });
+        return app.fetch(inner);
+      });
+    }
+  }
 
   return { app, env, accepts: activeAccepts, operations };
 }
