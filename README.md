@@ -1,4 +1,4 @@
-# Solana Wallet Intel — pay-per-call wallet intelligence for AI agents
+# Solana Wallet Intel — pay-per-call wallet intelligence for AI agents — by falcon.sol
 
 Live API: **https://solana-wallet-intel-phi.vercel.app**
 MCP server (streamable HTTP, POST JSON-RPC): **https://solana-wallet-intel-phi.vercel.app/mcp**
@@ -98,3 +98,7 @@ Reads use the configured Solana RPC, then free public mainnet endpoints when the
 ## License
 
 ISC
+
+---
+
+**Built by [falcon.sol](https://x.com/ygfalcon)**: anon dev shipping pay-per-call data tools and x402 APIs for builders and agents. [X](https://x.com/ygfalcon) · [GitHub](https://github.com/ygfalcon) · [Apify](https://apify.com/falcon-sol)

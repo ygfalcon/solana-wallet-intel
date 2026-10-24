@@ -1,3 +1,4 @@
+import { BRAND } from "./brand.js";
 import { FREE_WALLET_PREVIEW, type PaidOperation } from "./catalog.js";
 
 export const TRENDING_CHECKS = [
@@ -38,6 +39,8 @@ function callOrder(operations: PaidOperation[]): string[] {
 export function buildLlmsTxt(origin: string, operations: PaidOperation[]): string {
   const lines = [
     "# Solana Wallet x402",
+    "",
+    `${BRAND.blurb} X: ${BRAND.links.x} · GitHub: ${BRAND.links.github} · Apify: ${BRAND.links.apify}`,
     "",
     "> Pay-per-call Solana wallet intelligence. Agents pay USDC over x402 on Solana or Base. An unpaid call returns HTTP 402. accepts[].amount is USDC base units (6 decimals).",
     "",

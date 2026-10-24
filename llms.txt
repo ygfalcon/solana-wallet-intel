@@ -1,5 +1,7 @@
 # Solana Wallet x402
 
+Built by falcon.sol: anon dev shipping pay-per-call data tools and x402 APIs for builders and agents. X: https://x.com/ygfalcon · GitHub: https://github.com/ygfalcon · Apify: https://apify.com/falcon-sol
+
 > Pay-per-call Solana wallet intelligence. Agents pay USDC over x402 on Solana or Base. An unpaid call returns HTTP 402. accepts[].amount is USDC base units (6 decimals).
 
 ## Paid

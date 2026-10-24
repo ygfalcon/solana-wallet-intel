@@ -1,3 +1,4 @@
+import { BRAND } from "./brand.js";
 import type { ChainAccept } from "./config.js";
 import type { AppEnv } from "./config.js";
 import { FREE_WALLET_PREVIEW, type PaidOperation } from "./catalog.js";
@@ -68,11 +69,12 @@ export function buildOpenApi(env: AppEnv, operations: PaidOperation[], accepts: 
   return {
     openapi: "3.1.0",
     info: {
-      title: "Solana Wallet x402",
+      title: "Solana Wallet x402 " + BRAND.tagline,
       version: "1.0.0",
       description:
         "Pay-per-call Solana wallet profiles, funding-source clusters, and trending tokens. Agents pay USDC over x402 on Solana, and on Base through the Coinbase CDP facilitator when it is configured. Call free GET /wallet/preview or MCP wallet_preview before paying. Unpaid calls to paid routes return HTTP 402 even when the query is missing or invalid. A signed request with a bad query returns HTTP 400 and is not charged. GET /token/trending costs $0.0018 and includes holder concentration, mint and freeze authority, LP lock or burn status, and sniper or bundle share of early supply. Risky results are plain-English risk flags. Successful bodies include cached, stale, and cacheAgeMs.",
-      contact: { email: "falconsol@mail.grokbot.com" },
+      contact: { name: BRAND.name, url: BRAND.links.x, email: "falconsol@mail.grokbot.com" },
+      "x-provider": BRAND,
       "x-payment-info": {
         protocol: "x402",
         scheme: "exact",

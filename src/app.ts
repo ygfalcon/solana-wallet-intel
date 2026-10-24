@@ -1,3 +1,4 @@
+import { BRAND } from "./brand.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { ExactEvmScheme } from "@x402/evm/exact/server";
@@ -97,6 +98,7 @@ function discoveryDocument(
     protocol: "x402",
     version: 2,
     service: "solana-wallet-x402",
+    provider: BRAND,
     networkMode: env.networkMode,
     dataCluster: env.walletCluster,
     facilitators: {
@@ -362,7 +364,8 @@ export async function createApp(options: CreateAppOptions = {}) {
     c.header("cache-control", "public, max-age=60, s-maxage=60");
     return c.json({
       service: "solana-wallet-x402",
-      description: "Pay per call in USDC for a Solana wallet profile or the current trending-token list.",
+      description: "Pay per call in USDC for a Solana wallet profile or the current trending-token list. " + BRAND.tagline + ".",
+      provider: BRAND,
       networkMode: env.networkMode,
       payTo: { solana: env.solanaPayTo, base: env.evmPayTo ?? null },
       endpoints: {
@@ -648,7 +651,7 @@ export async function createApp(options: CreateAppOptions = {}) {
       c.header("cache-control", "no-store");
       return c.json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed. POST JSON-RPC to /mcp." }, id: null }, 405, { Allow: "POST" });
     }
-    const mcp = new McpServer({ name: "solana-wallet-x402", version: SERVICE_VERSION });
+    const mcp = new McpServer({ name: "solana-wallet-x402", title: "Solana Wallet x402 " + BRAND.tagline, version: SERVICE_VERSION });
     mcp.tool(
       "ping",
       "Free health check. Does not spend USDC. Confirms the MCP server is up and does not read a wallet.",
