@@ -110,6 +110,15 @@ describe("wallet profile assembly", () => {
     expect(profile.pnl.realizedUsd).toBe(4);
     expect(profile.pnl.unrealizedUsd).toBe(6);
     expect(profile.pnl.partialCostBasis).toBe(false);
+    expect(profile.copyTradeScore).toBe(0.556);
+    expect(profile.copyTradeGrade).toBe("C");
+    expect(profile.copyTrade.copyReturn).toBe(0.964);
+    expect(profile.copyTrade.winRate).toBe(1);
+    expect(profile.copyTrade.sampleSize).toBe(1);
+    expect(profile.copyTrade.delaySeconds).toBe(3);
+    expect(profile.copyTrade.roundTripCost).toBe(0.036);
+    expect(profile.copyTrade.penalties).toEqual([]);
+    expect(profile.summary).toContain("Copy-trade score is 0.556 (C)");
     expect(profile.activity.swapCount).toBe(2);
     expect(profile.summary.length).toBeGreaterThan(40);
     expect(profile.labelDetails.length).toBe(profile.labels.length);
@@ -156,6 +165,9 @@ describe("wallet profile assembly", () => {
     expect(profile.portfolioUsd).toBe(300.1);
     expect(profile.sources).toContain("helius");
     expect(profile.warnings.join(" ")).not.toContain("test-key");
+    expect(profile.copyTradeScore).toBeNull();
+    expect(profile.copyTradeGrade).toBeNull();
+    expect(profile.copyTrade.sampleSize).toBe(0);
   });
 
   it("ignores failed Helius transactions and nets USDC change", () => {

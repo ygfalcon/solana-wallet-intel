@@ -29,6 +29,7 @@ import { loadWalletFunding, type WalletFunding } from "./services/funding.js";
 import { buildWalletProfile, type WalletProfile } from "./services/wallet.js";
 import { buildWalletPreview } from "./services/preview.js";
 import { loadTrending, type TrendingResponse } from "./services/trending.js";
+import { observeFacilitator, revenueSummary, withRevenueRequestPath } from "./revenue.js";
 
 type WalletLoader = (env: AppEnv, address: string, txLimit: number) => Promise<Omit<WalletProfile, "cached" | "stale">>;
 type TrendingLoader = (env: AppEnv, limit: number) => Promise<Omit<TrendingResponse, "cached" | "stale">>;
@@ -198,9 +199,16 @@ function discoveryDocument(
   };
 }
 
+function secretOk(expected: string, given: string | undefined): boolean {
+  if (!given) return false;
+  const a = createHash("sha256").update(expected).digest();
+  const b = createHash("sha256").update(given).digest();
+  return timingSafeEqual(a, b);
+}
+
 export async function createApp(options: CreateAppOptions = {}) {
   const env = options.env ?? loadEnv();
-  const facilitator = options.facilitator ?? createFacilitator(env);
+  const facilitator = observeFacilitator(options.facilitator ?? createFacilitator(env));
   const operations = paidOperations(env);
   const resourceServer = new x402ResourceServer(facilitator).register(
     env.solana.network as Network,
@@ -269,10 +277,11 @@ export async function createApp(options: CreateAppOptions = {}) {
   const app = new Hono();
   app.use("*", async (c, next) => {
     const started = Date.now();
+    const path = new URL(c.req.url).pathname;
     await runWithSla(sla, async () => {
-      await next();
+      await withRevenueRequestPath(path, () => next());
     });
-    if (new URL(c.req.url).pathname !== "/health") sla.recordLatency(Date.now() - started);
+    if (path !== "/health") sla.recordLatency(Date.now() - started);
   });
   app.use(
     "*",
@@ -441,6 +450,9 @@ export async function createApp(options: CreateAppOptions = {}) {
       windowTransactions: p.window?.transactions ?? null,
       labels,
       summary: p.summary,
+      copyTradeScore: p.copyTradeScore ?? null,
+      copyTradeGrade: p.copyTradeGrade ?? null,
+      copyTrade: p.copyTrade ?? null,
     };
   }
   const quickLoad = (address: string) =>
@@ -802,14 +814,22 @@ export async function createApp(options: CreateAppOptions = {}) {
     return transport.handleRequest(c.req.raw);
   });
 
+  app.get("/internal/revenue", (c) => {
+    const expected = process.env.SWI_INTERNAL_KEY?.trim();
+    if (!expected || /^placeholder/i.test(expected)) {
+      c.header("cache-control", "no-store");
+      return c.json({ error: "channel_disabled", message: "The internal revenue channel is not configured." }, 503);
+    }
+    if (!secretOk(expected, c.req.header("x-swi-internal-key"))) {
+      c.header("cache-control", "no-store");
+      return c.json({ error: "unauthorized", message: "Missing or invalid x-swi-internal-key header." }, 401);
+    }
+    c.header("cache-control", "private, no-store");
+    return c.json(revenueSummary());
+  });
+
   // Partner channels (Apify Actor, RapidAPI): the same handlers as the x402 routes, authenticated by a
   // server-side shared secret instead of a per-call USDC payment. A missing or placeholder secret disables it.
-  function secretOk(expected: string, given: string | undefined): boolean {
-    if (!given) return false;
-    const a = createHash("sha256").update(expected).digest();
-    const b = createHash("sha256").update(given).digest();
-    return timingSafeEqual(a, b);
-  }
   const partners: Array<{ prefix: string; channel: string; header: string; secret: () => string | undefined }> = [
     { prefix: "/internal/v1", channel: "apify", header: "x-swi-internal-key", secret: () => process.env.SWI_INTERNAL_KEY?.trim() },
     { prefix: "/rapidapi/v1", channel: "rapidapi", header: "x-rapidapi-proxy-secret", secret: () => process.env.RAPIDAPI_PROXY_SECRET?.trim() },
