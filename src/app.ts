@@ -394,6 +394,8 @@ export async function createApp(options: CreateAppOptions = {}) {
   }
 
   app.all("/mcp", async (c) => {
+    // Stateless server: no standalone SSE stream. Open GETs otherwise hang until the 300s function timeout.
+    if (c.req.method === "GET") return c.json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed. POST JSON-RPC to /mcp." }, id: null }, 405, { Allow: "POST" });
     const mcp = new McpServer({ name: "solana-wallet-x402", version: "1.0.0" });
     mcp.tool("ping", "Free health check. Does not spend USDC.", {}, async () => ({
       content: [{ type: "text", text: "pong" }],
