@@ -1,15 +1,15 @@
 import type { AppEnv } from "../config.js";
 import { UpstreamError } from "../http.js";
-import { createPublicRpc, PUBLIC_SOLANA_RPCS } from "../public-rpc.js";
+import { mainnetPreviewEndpoints, sharedPublicRpc } from "../public-rpc.js";
 
 type RpcResponse<T> = { result?: T; error?: { message?: string } };
 
 /** Free teaser: SOL balance and recent activity in one batched JSON-RPC request. */
 export async function buildWalletPreview(env: AppEnv, address: string) {
-  const endpoints = [env.solanaRpcUrl, ...PUBLIC_SOLANA_RPCS.filter((u) => u !== env.solanaRpcUrl)];
+  const endpoints = env.walletCluster === "mainnet" ? mainnetPreviewEndpoints(env.solanaRpcUrl) : [env.solanaRpcUrl];
   let results: unknown[];
   try {
-    results = await createPublicRpc({ endpoints }).batch([
+    results = await sharedPublicRpc(endpoints).batch([
       { method: "getBalance", params: [address] },
       { method: "getSignaturesForAddress", params: [address, { limit: 25 }] },
     ]);

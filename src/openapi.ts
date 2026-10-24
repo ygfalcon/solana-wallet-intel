@@ -1,6 +1,6 @@
 import type { ChainAccept } from "./config.js";
 import type { AppEnv } from "./config.js";
-import type { PaidOperation } from "./catalog.js";
+import { FREE_WALLET_PREVIEW, type PaidOperation } from "./catalog.js";
 
 export function buildOpenApi(env: AppEnv, operations: PaidOperation[], accepts: ChainAccept[], origin: string) {
   const paths: Record<string, unknown> = {};
@@ -52,8 +52,14 @@ export function buildOpenApi(env: AppEnv, operations: PaidOperation[], accepts: 
               },
             },
           },
-          "400": { description: "The query failed validation. Settlement is cancelled." },
-          "502": { description: "Upstream market data was unavailable. Settlement is cancelled." },
+          "400": {
+            description: "A signed request failed validation before settlement. Unpaid probes receive 402 instead. The buyer is not charged.",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+          },
+          "502": {
+            description: "Upstream market data was unavailable. Settlement is cancelled. retryable is true for timeouts, rate limits, and 5xx.",
+            content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+          },
         },
       },
     };
@@ -65,7 +71,7 @@ export function buildOpenApi(env: AppEnv, operations: PaidOperation[], accepts: 
       title: "Solana Wallet x402",
       version: "1.0.0",
       description:
-        "Pay-per-call Solana wallet profiles, funding-source clusters, and trending tokens. Agents pay USDC over x402 on Solana, and on Base through the Coinbase CDP facilitator when it is configured. GET /token/trending costs $0.0018 and includes holder concentration, mint and freeze authority, LP lock or burn status, and sniper or bundle share of early supply. Risky results are plain-English risk flags.",
+        "Pay-per-call Solana wallet profiles, funding-source clusters, and trending tokens. Agents pay USDC over x402 on Solana, and on Base through the Coinbase CDP facilitator when it is configured. Call free GET /wallet/preview or MCP wallet_preview before paying. Unpaid calls to paid routes return HTTP 402 even when the query is missing or invalid. A signed request with a bad query returns HTTP 400 and is not charged. GET /token/trending costs $0.0018 and includes holder concentration, mint and freeze authority, LP lock or burn status, and sniper or bundle share of early supply. Risky results are plain-English risk flags. Successful bodies include cached, stale, and cacheAgeMs.",
       contact: { email: "falconsol@mail.grokbot.com" },
       "x-payment-info": {
         protocol: "x402",
@@ -80,13 +86,49 @@ export function buildOpenApi(env: AppEnv, operations: PaidOperation[], accepts: 
       ...paths,
       "/wallet/preview": {
         get: {
-          operationId: "wallet_preview",
-          summary: "Free wallet preview",
-          description: "Free SOL balance, last active time and 24h transaction count. No payment.",
+          operationId: FREE_WALLET_PREVIEW.id,
+          summary: FREE_WALLET_PREVIEW.summary,
+          description: `${FREE_WALLET_PREVIEW.description} MCP tool ${FREE_WALLET_PREVIEW.mcpTool}.`,
           tags: ["free"],
           security: [],
-          parameters: [{ name: "address", in: "query", required: true, schema: { type: "string", description: "Solana wallet address in base58." } }],
-          responses: { "200": { description: "Wallet preview" }, "400": { description: "Invalid address" } },
+          parameters: [
+            {
+              name: "address",
+              in: "query",
+              required: true,
+              schema: { type: "string", description: FREE_WALLET_PREVIEW.inputSchema.properties.address.description },
+            },
+          ],
+          responses: {
+            "200": {
+              description: "Wallet preview. May be cached at the edge for a few seconds.",
+              content: {
+                "application/json": {
+                  schema: { type: "object" },
+                  example: {
+                    address: "HD1ryR3dYSXBVNGfJZydbpmnChiE1wrAQkupWWtHt4pM",
+                    solBalance: 1.25,
+                    lastActiveAt: "2026-10-23T18:00:00.000Z",
+                    recentTxs24h: 3,
+                    recentTxs24hCapped: false,
+                    labels: ["recently active"],
+                    preview: true,
+                    cached: false,
+                    stale: false,
+                    cacheAgeMs: 0,
+                  },
+                },
+              },
+            },
+            "400": {
+              description: "Invalid address. No payment.",
+              content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+            },
+            "502": {
+              description: "Public Solana RPC was unavailable.",
+              content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
+            },
+          },
         },
       },
       "/health": {
@@ -112,7 +154,7 @@ export function buildOpenApi(env: AppEnv, operations: PaidOperation[], accepts: 
                         type: "object",
                         required: ["version", "windowMs", "latency", "upstream", "cache"],
                         properties: {
-                          version: { type: "string", examples: ["1.0.0"] },
+                          version: { type: "string", examples: ["1.1.0"] },
                           windowMs: { type: "integer", description: "Rolling window for latency and upstream samples. Default 300000." },
                           latency: {
                             type: "object",
@@ -174,6 +216,19 @@ export function buildOpenApi(env: AppEnv, operations: PaidOperation[], accepts: 
     },
     components: {
       schemas: {
+        Error: {
+          type: "object",
+          required: ["error", "message", "retryable"],
+          properties: {
+            error: {
+              type: "string",
+              description: "Stable machine code.",
+              examples: ["invalid_address", "invalid_tx_limit", "invalid_limit", "invalid_peers", "upstream_failed"],
+            },
+            message: { type: "string", description: "What to change. Secrets are redacted." },
+            retryable: { type: "boolean", description: "True when a later attempt can succeed. False for validation errors." },
+          },
+        },
         PaymentRequired: {
           type: "object",
           required: ["x402Version", "accepts", "inputSchema"],
@@ -192,7 +247,7 @@ export function buildOpenApi(env: AppEnv, operations: PaidOperation[], accepts: 
                   amount: {
                     type: "string",
                     description: "USDC base units. 6 decimals, so 0.01 USDC is \"10000\".",
-                    examples: ["10000", "5000"],
+                    examples: ["9000", "1800", "15000", "2000"],
                   },
                   asset: { type: "string", description: "USDC mint or contract." },
                   payTo: { type: "string" },

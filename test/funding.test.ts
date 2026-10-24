@@ -358,6 +358,27 @@ describe("funding source and clusters", () => {
   });
 });
 
+describe("parsed native transfers", () => {
+  it("does not let a repeated loaded address shift balance indexes", () => {
+    const transfers = nativeTransfersFromParsed(
+      {
+        blockTime: 1,
+        meta: {
+          err: null,
+          fee: 0,
+          preBalances: [10, 0],
+          postBalances: [4, 6],
+          loadedAddresses: { writable: [WALLET, PEER], readonly: [] },
+          innerInstructions: [],
+        },
+        transaction: { message: { accountKeys: [WALLET], instructions: [] } },
+      },
+      "sig",
+    );
+    expect(transfers).toEqual([expect.objectContaining({ from: WALLET, to: PEER, lamports: 6 })]);
+  });
+});
+
 describe("funding loader", () => {
   it("pages to the oldest transfer and follows a deposit sweep to Binance", async () => {
     globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {

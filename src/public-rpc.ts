@@ -19,13 +19,13 @@ type RpcOptions = {
   sleep?: (ms: number) => Promise<void>;
 };
 
-function isUsableEndpoint(url: string): boolean {
+export function isUsableEndpoint(url: string): boolean {
   return !/helius|api-key=/i.test(url);
 }
 
 export function createPublicRpc(options: RpcOptions = {}) {
   const endpoints = (options.endpoints ?? PUBLIC_SOLANA_RPCS).filter(isUsableEndpoint);
-  const fetchImpl = options.fetch ?? fetch;
+  const fetchImpl = options.fetch;
   const minIntervalMs = options.minIntervalMs ?? 250;
   const now = options.now ?? Date.now;
   const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
@@ -51,7 +51,7 @@ export function createPublicRpc(options: RpcOptions = {}) {
       const endpoint = endpoints[cursor % endpoints.length];
       cursor += 1;
       try {
-        const response = await fetchImpl(endpoint, {
+        const response = await (fetchImpl ?? globalThis.fetch)(endpoint, {
           method: "POST",
           headers: { accept: "application/json", "content-type": "application/json" },
           body: JSON.stringify(body),
@@ -72,14 +72,20 @@ export function createPublicRpc(options: RpcOptions = {}) {
           currentSla()?.noteUpstream({ source: "solana-rpc", httpStatus: response.status, rateLimited });
           continue;
         }
-        currentSla()?.noteUpstream({ source: "solana-rpc", httpStatus: response.status, rateLimited: false });
         const byId = new Map<number, unknown>();
+        let rateLimited = false;
         for (const item of payload) {
           if (!item || typeof item !== "object" || !("id" in item)) continue;
           const id = Number((item as { id: unknown }).id);
           const error = (item as { error?: unknown }).error;
+          if (error && rpcBodyRateLimited({ error })) rateLimited = true;
           byId.set(id, error ? null : ((item as { result?: unknown }).result ?? null));
         }
+        if (rateLimited) {
+          currentSla()?.noteUpstream({ source: "solana-rpc", httpStatus: 429, rateLimited: true });
+          continue;
+        }
+        currentSla()?.noteUpstream({ source: "solana-rpc", httpStatus: response.status, rateLimited: false });
         return requests.map((_, index) => (byId.has(index + 1) ? byId.get(index + 1) : null));
       } catch {
         continue;
@@ -98,4 +104,24 @@ export function createPublicRpc(options: RpcOptions = {}) {
       return results;
     },
   };
+}
+
+const sharedClients = new Map<string, ReturnType<typeof createPublicRpc>>();
+
+/** One paced client per endpoint set, so warm isolates respect the free RPC interval across requests. */
+export function sharedPublicRpc(endpoints: string[] = PUBLIC_SOLANA_RPCS) {
+  const usable = endpoints.filter(isUsableEndpoint);
+  const key = usable.join("\n");
+  let client = sharedClients.get(key);
+  if (!client) {
+    client = createPublicRpc({ endpoints: usable });
+    sharedClients.set(key, client);
+  }
+  return client;
+}
+
+export function mainnetPreviewEndpoints(primary: string): string[] {
+  const primaryOk = isUsableEndpoint(primary);
+  const urls = primaryOk ? [primary, ...PUBLIC_SOLANA_RPCS] : [...PUBLIC_SOLANA_RPCS];
+  return [...new Set(urls)].filter(isUsableEndpoint);
 }

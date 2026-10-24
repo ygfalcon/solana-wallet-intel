@@ -9,7 +9,8 @@ import {
   type NativeTransfer,
   type WalletActivity,
 } from "../funding.js";
-import { fetchJson, UpstreamError } from "../http.js";
+import { mapPool } from "../pool.js";
+import { solanaRpc } from "../solana-rpc.js";
 
 const RECENT_TRANSACTIONS = 20;
 const OLDEST_TRANSACTIONS = 8;
@@ -17,7 +18,6 @@ const MAX_DEPOSIT_TRACES = 3;
 const MIN_TRACE_LAMPORTS = 10_000_000;
 
 type SignatureRow = { signature: string; blockTime: number | null; err?: unknown };
-type RpcResponse<T> = { result?: T; error?: { message?: string } };
 
 export type WalletFunding = FundingReport & {
   asOf: string;
@@ -25,21 +25,10 @@ export type WalletFunding = FundingReport & {
   sources: string[];
 };
 
-async function rpc<T>(url: string, method: string, params: unknown[]): Promise<T> {
-  const body = await fetchJson<RpcResponse<T>>(url, {
-    source: "solana-rpc",
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: method, method, params }),
-  });
-  if (body.error) throw new UpstreamError(body.error.message ?? "RPC error", "solana-rpc");
-  return body.result as T;
-}
-
 async function signaturesFor(env: AppEnv, address: string, limit: number, before?: string): Promise<SignatureRow[]> {
   const config: { limit: number; before?: string } = { limit };
   if (before) config.before = before;
-  const rows = await rpc<SignatureRow[] | null>(env.solanaRpcUrl, "getSignaturesForAddress", [address, config]);
+  const rows = await solanaRpc<SignatureRow[] | null>(env, "getSignaturesForAddress", [address, config]);
   return rows ?? [];
 }
 
@@ -57,19 +46,16 @@ async function pageSignatures(env: AppEnv, address: string): Promise<{ signature
 }
 
 async function transfersFor(env: AppEnv, rows: SignatureRow[]): Promise<NativeTransfer[]> {
-  const transfers: NativeTransfer[] = [];
-  await Promise.all(
-    rows.map(async (row) => {
-      if (row.err) return;
-      const tx = await rpc<Parameters<typeof nativeTransfersFromParsed>[0] | null>(env.solanaRpcUrl, "getTransaction", [
-        row.signature,
-        { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 },
-      ]);
-      if (!tx) return;
-      transfers.push(...nativeTransfersFromParsed(tx, row.signature));
-    }),
-  );
-  return transfers;
+  const groups = await mapPool(rows, 4, async (row) => {
+    if (row.err) return [] as NativeTransfer[];
+    const tx = await solanaRpc<Parameters<typeof nativeTransfersFromParsed>[0] | null>(env, "getTransaction", [
+      row.signature,
+      { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 },
+    ]);
+    if (!tx) return [] as NativeTransfer[];
+    return nativeTransfersFromParsed(tx, row.signature);
+  });
+  return groups.flat();
 }
 
 async function activityFor(env: AppEnv, address: string): Promise<{ activity: WalletActivity; warnings: string[] }> {
@@ -105,8 +91,7 @@ async function activityFor(env: AppEnv, address: string): Promise<{ activity: Wa
 }
 
 export async function loadWalletFunding(env: AppEnv, address: string, peers: string[]): Promise<WalletFunding> {
-  const loaded = [];
-  for (const wallet of [address, ...peers]) loaded.push(await activityFor(env, wallet));
+  const loaded = await mapPool([address, ...peers], 2, (wallet) => activityFor(env, wallet));
   const report = assessFunding(
     address,
     loaded.map((item) => item.activity),
