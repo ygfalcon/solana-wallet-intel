@@ -1,0 +1,14 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.ygfalcon/solana-wallet-intel",
+  "description": "Solana wallet PnL, holdings, win rate and trending tokens w/ rug flags. Pay-per-call x402 USDC.",
+  "title": "Solana Wallet Intel (x402)",
+  "version": "1.0.0",
+  "websiteUrl": "https://solana-wallet-intel-phi.vercel.app",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://solana-wallet-intel-phi.vercel.app/mcp"
+    }
+  ]
+}
