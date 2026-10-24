@@ -124,6 +124,6 @@ describe("upstream observation", () => {
 describe("service version", () => {
   it("matches package.json", () => {
     expect(SERVICE_VERSION).toBe(packageJson.version);
-    expect(SERVICE_VERSION).toBe("1.0.0");
+    expect(SERVICE_VERSION).toBe("1.1.0");
   });
 });

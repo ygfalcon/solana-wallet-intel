@@ -1,5 +1,27 @@
 import { usdToBaseUnits, type AppEnv, type ChainAccept } from "./config.js";
 
+export const FREE_WALLET_PREVIEW = {
+  id: "wallet_preview" as const,
+  mcpTool: "wallet_preview" as const,
+  method: "GET" as const,
+  path: "/wallet/preview" as const,
+  price: "$0",
+  amount: "0",
+  summary: "Free wallet preview",
+  description:
+    "Free teaser. Call this before any paid wallet tool. Returns SOL balance, last active time, how many transactions landed in the last 24 hours, and a dormant or recently-active label. Does not spend USDC. Pass one base58 Solana address. Invalid addresses return an error and do not ask for payment. Upgrade to wallet_quick for a copy-trade screen, wallet_profile for priced holdings, or wallet_funding for the first SOL funder and cluster.",
+  inputSchema: {
+    type: "object" as const,
+    properties: {
+      address: {
+        type: "string",
+        description: "Solana wallet address in base58 (32 to 44 characters). Invalid addresses return HTTP 400. This route is free.",
+      },
+    },
+    required: ["address"],
+  },
+};
+
 export type PaidOperation = {
   id: "wallet_profile" | "token_trending" | "wallet_funding" | "wallet_quick" | "wallet_quick_batch";
   mcpTool: "wallet_profile" | "token_trending" | "wallet_funding" | "wallet_quick" | "wallet_quick_batch";
@@ -29,17 +51,17 @@ export function paidOperations(env: AppEnv): PaidOperation[] {
       amount: usdToBaseUnits(env.priceWalletProfile),
       summary: "Solana wallet profile",
       description:
-        "Holdings valued in USD, a short plain-language summary, windowed realized and unrealized PnL, win rate, and evidence-backed labels such as active memecoin trader.",
+        "Use this when you need priced holdings and windowed PnL for one Solana wallet. Holdings valued in USD, a short plain-language summary, windowed realized and unrealized PnL, win rate, and evidence-backed labels such as active memecoin trader. txLimit is an integer from 5 to 25 and defaults to 20. Call free wallet_preview first if you only need SOL balance and last-active time, or wallet_quick for a cheaper copy-trade screen.",
       inputSchema: {
         type: "object",
         properties: {
           address: {
             type: "string",
-            description: "Solana wallet address in base58.",
+            description: "Solana wallet address in base58 (32 to 44 characters). Unpaid requests return HTTP 402. A signed request with an invalid address returns HTTP 400 and is not charged.",
           },
           txLimit: {
             type: "string",
-            description: "Recent transactions to inspect, from 5 to 25. Defaults to 20.",
+            description: "Recent signatures to inspect, integer from 5 to 25. Defaults to 20. Unpaid requests return HTTP 402. A signed request with an out-of-range value returns HTTP 400 and is not charged.",
           },
         },
         required: ["address"],
@@ -75,13 +97,13 @@ export function paidOperations(env: AppEnv): PaidOperation[] {
       amount: usdToBaseUnits(env.priceTokenTrending),
       summary: "Trending Solana tokens",
       description:
-        "Trending Solana tokens with liquidity, 24h volume, pair age, and a short summary. Each token includes holder concentration (top-10 share), mint and freeze authority, LP lock or burn status, and sniper or bundle share of early supply. Risky results are plain-English risk flags. Thin, new, and wash-like books are ranked down.",
+        "Use this when you need the Solana tokens traders are watching right now. Trending Solana tokens with liquidity, 24h volume, pair age, and a short summary. Each token includes holder concentration (top-10 share), mint and freeze authority, LP lock or burn status, and sniper or bundle share of early supply. Risky results are plain-English risk flags. Thin, new, and wash-like books are ranked down. limit is an integer from 1 to 25 and defaults to 15.",
       inputSchema: {
         type: "object",
         properties: {
           limit: {
             type: "string",
-            description: "How many tokens to return, from 1 to 25. Defaults to 15.",
+            description: "How many tokens to return, integer from 1 to 25. Defaults to 15. Unpaid requests return HTTP 402. A signed request with an out-of-range value returns HTTP 400 and is not charged. MCP also accepts a JSON integer.",
           },
         },
         required: [],
@@ -121,18 +143,18 @@ export function paidOperations(env: AppEnv): PaidOperation[] {
       amount: usdToBaseUnits(env.priceWalletFunding),
       summary: "Wallet funding source and cluster",
       description:
-        "Find a wallet's first SOL funder, flag wallets that share that funder or a CEX deposit address, and return a cluster id with plain-language sybil risk reasons. Labeled exchange hot wallets are not used as a cluster. Optional peers compares up to 8 other wallets.",
+        "Use this when you need a wallet's first SOL funder and whether other wallets look like the same operator. Find a wallet's first SOL funder, flag wallets that share that funder or a CEX deposit address, and return a cluster id with plain-language sybil risk reasons. Labeled exchange hot wallets are not used as a cluster. Optional peers compares up to 8 other wallets.",
       inputSchema: {
         type: "object",
         properties: {
           address: {
             type: "string",
-            description: "Solana wallet address in base58.",
+            description: "Solana wallet address in base58 (32 to 44 characters). Unpaid requests return HTTP 402. A signed request with an invalid address returns HTTP 400 and is not charged.",
           },
           peers: {
             type: "string",
             description:
-              "Comma-separated peer wallets to compare, up to 8. Wallets that share a personal first funder or a CEX deposit address join one cluster.",
+              "Comma-separated peer wallets to compare, up to 8. Each must be base58. The primary address is rejected. Unpaid requests return HTTP 402. A signed request with invalid peers returns HTTP 400 and is not charged. Wallets that share a personal first funder or a CEX deposit address join one cluster.",
           },
         },
         required: ["address"],
@@ -173,11 +195,14 @@ export function paidOperations(env: AppEnv): PaidOperation[] {
       amount: usdToBaseUnits(env.priceWalletQuick),
       summary: "Solana wallet quick screen",
       description:
-        "Cheap copy-trade screen for one wallet: windowed realized PnL, win rate, closed trades, last active time, and bot, exchange, net-winner and dormant flags. Free teaser at /wallet/preview; full report at /wallet/profile.",
+        "Use this for a cheap copy-trade screen before paying for a full profile. Cheap copy-trade screen for one wallet: windowed realized PnL, win rate, closed trades, last active time, and bot, exchange, net-winner and dormant flags. Free teaser at /wallet/preview; full report at /wallet/profile.",
       inputSchema: {
         type: "object",
         properties: {
-          address: { type: "string", description: "Solana wallet address in base58." },
+          address: {
+            type: "string",
+            description: "Solana wallet address in base58 (32 to 44 characters). Unpaid requests return HTTP 402. A signed request with an invalid address returns HTTP 400 and is not charged.",
+          },
         },
         required: ["address"],
       },
@@ -208,7 +233,13 @@ export function paidOperations(env: AppEnv): PaidOperation[] {
         "Quick screen (windowed realized PnL, win rate, bot, exchange, net-winner and dormant flags) for up to 10 Solana wallets in one paid call, ranked by realized PnL. Pass addresses comma-separated.",
       inputSchema: {
         type: "object",
-        properties: { addresses: { type: "string", description: "Up to 10 comma-separated base58 Solana wallet addresses." } },
+        properties: {
+          addresses: {
+            type: "string",
+            description:
+              "1 to 10 comma-separated base58 Solana wallet addresses. Unpaid requests return HTTP 402. A signed request with a bad list returns HTTP 400 and is not charged.",
+          },
+        },
         required: ["addresses"],
       },
       example: { addresses: "HD1ryR3dYSXBVNGfJZydbpmnChiE1wrAQkupWWtHt4pM,suqh5sHtr8HyJ7q8scBimULPkPpA557prMG47xCHQfK" },
@@ -219,6 +250,10 @@ export function paidOperations(env: AppEnv): PaidOperation[] {
       },
     },
   ];
+}
+
+export function mcpToolDescription(operation: PaidOperation): string {
+  return `${operation.description} Costs ${operation.price} USDC (${operation.amount} base units) via x402. The same price is charged for HTTP ${operation.method} ${operation.path}. An unpaid HTTP call returns 402 even when the query is missing or invalid. A signed call with invalid arguments is rejected before settlement and is not charged. A successful result can set cached, stale, and cacheAgeMs. stale true means a previous result was served while a refresh runs or the upstream failed. You are charged only when the tool result is not an error.`;
 }
 
 export function operationForPath(path: string, env: AppEnv): PaidOperation | undefined {

@@ -102,6 +102,7 @@ export function parsePeerList(
   primary: string,
 ): { peers: string[] } | { error: string } {
   if (!value?.trim()) return { peers: [] };
+  if (value.length > 2_000) return { error: "peers must be a comma-separated list of Solana addresses." };
   const parts = value
     .split(",")
     .map((part) => part.trim())
@@ -158,7 +159,8 @@ function accountKeysOf(tx: ParsedTransaction): string[] {
   const loaded = [...(tx.meta?.loadedAddresses?.writable ?? []), ...(tx.meta?.loadedAddresses?.readonly ?? [])];
   for (const key of loaded) {
     if (keys.length >= balanceCount) break;
-    keys.push(key);
+    // A loaded address that repeats a static key must not consume a balance slot.
+    if (!keys.includes(key)) keys.push(key);
   }
   return keys;
 }

@@ -12,17 +12,18 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { z } from "zod";
 import { timingSafeEqual, createHash, randomBytes } from "node:crypto";
-import { enabledAccepts, operationForPath, paidOperations, type PaidOperation } from "./catalog.js";
+import { enabledAccepts, FREE_WALLET_PREVIEW, mcpToolDescription, operationForPath, paidOperations, type PaidOperation } from "./catalog.js";
 import { createCache } from "./cache.js";
 import { loadEnv, type AppEnv, type ChainAccept } from "./config.js";
 import { createFacilitator } from "./facilitator.js";
 import { parsePeerList } from "./funding.js";
 import { redactSecrets, UpstreamError } from "./http.js";
 import { buildLlmsTxt, trendingPricingNote } from "./llms.js";
-import { createSlaTracker, runWithSla, type SlaSnapshot } from "./sla.js";
+import { createSlaTracker, runWithSla, SERVICE_VERSION, type SlaSnapshot } from "./sla.js";
 import { buildOpenApi } from "./openapi.js";
 import { faviconIco } from "./favicon.js";
 import { isSolanaAddress } from "./solana.js";
+import { parseBoundedInt } from "./validate.js";
 import { loadWalletFunding, type WalletFunding } from "./services/funding.js";
 import { buildWalletProfile, type WalletProfile } from "./services/wallet.js";
 import { buildWalletPreview } from "./services/preview.js";
@@ -48,11 +49,19 @@ function originFrom(env: AppEnv, requestUrl: string): string {
   return url.origin;
 }
 
-function publicFailure(error: unknown, fallback: string): { status: 502 | 500; body: { error: string; message: string; retryable: boolean } } {
+function publicFailure(error: unknown, fallback: string): {
+  status: 502 | 500;
+  retryAfter?: number;
+  body: { error: string; message: string; retryable: boolean };
+} {
   const raw = error instanceof Error ? error.message : "";
   if (raw) console.error(redactSecrets(raw));
   if (error instanceof UpstreamError) {
-    return { status: 502, body: { error: "upstream_failed", message: redactSecrets(error.message), retryable: true } };
+    return {
+      status: 502,
+      retryAfter: error.status === 429 ? 2 : undefined,
+      body: { error: "upstream_failed", message: redactSecrets(error.message), retryable: error.retryable },
+    };
   }
   return { status: 500, body: { error: "lookup_failed", message: fallback, retryable: false } };
 }
@@ -63,12 +72,18 @@ export function parseAddressList(raw: string | undefined, max = 10): string[] | 
   return list;
 }
 
-function clampInt(value: string | undefined, fallback: number, min: number, max: number): number | null {
-  if (value === undefined || value === "") return fallback;
-  if (!/^\d+$/.test(value)) return null;
-  const parsed = Number(value);
-  if (parsed < min || parsed > max) return null;
-  return parsed;
+const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true } as const;
+
+function toolJson(value: unknown) {
+  return { content: [{ type: "text" as const, text: JSON.stringify(value) }] };
+}
+
+function toolError(body: { error: string; message: string; retryable: boolean }) {
+  return { isError: true as const, content: [{ type: "text" as const, text: JSON.stringify(body) }] };
+}
+
+function cacheMeta(hit: { cached: boolean; stale: boolean; ageMs: number }) {
+  return { cached: hit.cached, stale: hit.stale, cacheAgeMs: hit.ageMs };
 }
 
 function discoveryDocument(
@@ -131,16 +146,45 @@ function discoveryDocument(
         decimals: 6,
       })),
     })),
+    free: [
+      {
+        method: FREE_WALLET_PREVIEW.method,
+        path: FREE_WALLET_PREVIEW.path,
+        url: `${origin}${FREE_WALLET_PREVIEW.path}`,
+        description: FREE_WALLET_PREVIEW.description,
+        price: FREE_WALLET_PREVIEW.price,
+        amount: FREE_WALLET_PREVIEW.amount,
+        inputSchema: FREE_WALLET_PREVIEW.inputSchema,
+        mcpTool: FREE_WALLET_PREVIEW.mcpTool,
+      },
+    ],
     mcp: {
       transport: "streamable-http",
       url: `${origin}/mcp`,
-      tools: operations.map((operation) => ({
-        name: operation.mcpTool,
-        description: operation.description,
-        price: operation.price,
-        amount: operation.amount,
-        inputSchema: operation.inputSchema,
-      })),
+      instructions:
+        "Call ping or wallet_preview before a paid tool. wallet_preview is free. Unpaid HTTP calls return 402 even when the query is missing or invalid. A signed request with a bad query returns 400 and is not charged. GET /mcp is not supported; POST JSON-RPC.",
+      tools: [
+        {
+          name: "ping",
+          description: "Free health check. Does not spend USDC. Confirms the MCP server is up and does not read a wallet.",
+          price: "$0",
+          amount: "0",
+        },
+        {
+          name: FREE_WALLET_PREVIEW.mcpTool,
+          description: FREE_WALLET_PREVIEW.description,
+          price: FREE_WALLET_PREVIEW.price,
+          amount: FREE_WALLET_PREVIEW.amount,
+          inputSchema: FREE_WALLET_PREVIEW.inputSchema,
+        },
+        ...operations.map((operation) => ({
+          name: operation.mcpTool,
+          description: mcpToolDescription(operation),
+          price: operation.price,
+          amount: operation.amount,
+          inputSchema: operation.inputSchema,
+        })),
+      ],
     },
     openapi: `${origin}/openapi.json`,
     llms: `${origin}/llms.txt`,
@@ -171,7 +215,9 @@ export async function createApp(options: CreateAppOptions = {}) {
       .map((kind) => kind.network);
     if (exact.length > 0) supported = new Set(exact);
   } catch (error) {
-    console.warn(`Facilitator /supported failed at startup: ${error instanceof Error ? error.message : error}`);
+    console.warn(
+      `Facilitator /supported failed at startup: ${redactSecrets(error instanceof Error ? error.message : String(error))}`,
+    );
   }
 
   const accepts = enabledAccepts(env, supported);
@@ -226,7 +272,16 @@ export async function createApp(options: CreateAppOptions = {}) {
     });
     if (new URL(c.req.url).pathname !== "/health") sla.recordLatency(Date.now() - started);
   });
-  app.use("*", cors());
+  app.use(
+    "*",
+    cors({
+      origin: "*",
+      allowMethods: ["GET", "POST", "HEAD", "OPTIONS"],
+      allowHeaders: ["Content-Type", "Accept", "PAYMENT-SIGNATURE", "X-PAYMENT"],
+      exposeHeaders: ["PAYMENT-REQUIRED", "PAYMENT-RESPONSE", "X-PAYMENT-RESPONSE"],
+      maxAge: 86400,
+    }),
+  );
   app.use("*", async (c, next) => {
     await next();
     if (c.res.status !== 402) return;
@@ -244,6 +299,7 @@ export async function createApp(options: CreateAppOptions = {}) {
     const inputSchema = operation?.inputSchema ?? bazaar?.schema?.properties?.input?.properties?.queryParams ?? { type: "object" };
     const headers = new Headers(c.res.headers);
     headers.set("content-type", "application/json; charset=utf-8");
+    headers.set("cache-control", "no-store");
     c.res = new Response(JSON.stringify({ ...paymentRequired, inputSchema }), { status: 402, headers });
   });
 
@@ -258,12 +314,34 @@ export async function createApp(options: CreateAppOptions = {}) {
       return;
     }
     const path = new URL(c.req.url).pathname;
-    if (path === "/wallet/profile" || path === "/wallet/quick" || path === "/wallet/funding") {
-      const a = c.req.query("address")?.trim() ?? "";
-      if (!isSolanaAddress(a)) return c.json({ error: "invalid_address", message: "Query address must be a Solana base58 public key. You were not charged.", retryable: false }, 400);
+    const fail = (error: string, message: string) => {
+      c.header("cache-control", "no-store");
+      return c.json({ error, message, retryable: false }, 400);
+    };
+    if (path === "/wallet/profile" || path === "/wallet/quick" || path === "/wallet/funding" || path === "/wallet/preview") {
+      const address = c.req.query("address")?.trim() ?? "";
+      if (!isSolanaAddress(address)) {
+        return fail("invalid_address", "Query address must be a Solana base58 public key. You were not charged.");
+      }
+    }
+    if (path === "/wallet/profile") {
+      const txLimit = parseBoundedInt(c.req.query("txLimit"), 20, 5, 25);
+      if (txLimit === null) return fail("invalid_tx_limit", "txLimit must be an integer from 5 to 25. You were not charged.");
+    }
+    if (path === "/wallet/funding") {
+      const address = c.req.query("address")?.trim() ?? "";
+      const peers = parsePeerList(c.req.query("peers"), address);
+      if ("error" in peers) return fail("invalid_peers", `${peers.error} You were not charged.`);
+    }
+    if (path === "/token/trending") {
+      const limit = parseBoundedInt(c.req.query("limit"), 15, 1, 25);
+      if (limit === null) return fail("invalid_limit", "limit must be an integer from 1 to 25. You were not charged.");
     }
     if (path === "/wallet/quick/batch" && parseAddressList(c.req.query("addresses")) === null) {
-      return c.json({ error: "invalid_addresses", message: "addresses must be 1 to 10 comma-separated base58 Solana addresses. You were not charged.", retryable: false }, 400);
+      return fail(
+        "invalid_addresses",
+        "addresses must be 1 to 10 comma-separated base58 Solana addresses. You were not charged.",
+      );
     }
     await next();
   });
@@ -281,6 +359,7 @@ export async function createApp(options: CreateAppOptions = {}) {
 
   app.get("/", (c) => {
     const origin = originFrom(env, c.req.url);
+    c.header("cache-control", "public, max-age=60, s-maxage=60");
     return c.json({
       service: "solana-wallet-x402",
       description: "Pay per call in USDC for a Solana wallet profile or the current trending-token list.",
@@ -312,8 +391,9 @@ export async function createApp(options: CreateAppOptions = {}) {
     });
   });
 
-  app.get("/health", (c) =>
-    c.json({
+  app.get("/health", (c) => {
+    c.header("cache-control", "no-store");
+    return c.json({
       ok: true,
       service: "solana-wallet-x402",
       networkMode: env.networkMode,
@@ -324,14 +404,21 @@ export async function createApp(options: CreateAppOptions = {}) {
         facilitator: accept.facilitator,
       })),
       sla: sla.snapshot(cache.stats()),
-    }),
-  );
+    });
+  });
 
-  app.get("/openapi.json", (c) => c.json(buildOpenApi(env, operations, activeAccepts, originFrom(env, c.req.url))));
-  app.get("/.well-known/x402", (c) =>
-    c.json(discoveryDocument(env, operations, activeAccepts, originFrom(env, c.req.url), sla.snapshot(cache.stats()))),
-  );
-  app.get("/llms.txt", (c) => c.text(buildLlmsTxt(originFrom(env, c.req.url), operations)));
+  app.get("/openapi.json", (c) => {
+    c.header("cache-control", "public, max-age=300, s-maxage=300");
+    return c.json(buildOpenApi(env, operations, activeAccepts, originFrom(env, c.req.url)));
+  });
+  app.get("/.well-known/x402", (c) => {
+    c.header("cache-control", "no-store");
+    return c.json(discoveryDocument(env, operations, activeAccepts, originFrom(env, c.req.url), sla.snapshot(cache.stats())));
+  });
+  app.get("/llms.txt", (c) => {
+    c.header("cache-control", "public, max-age=300, s-maxage=300");
+    return c.text(buildLlmsTxt(originFrom(env, c.req.url), operations));
+  });
 
   function quickOf(p: Omit<WalletProfile, "cached" | "stale">) {
     const labels = p.labels ?? [];
@@ -374,8 +461,10 @@ export async function createApp(options: CreateAppOptions = {}) {
   app.get("/wallet/quick/batch", async (c) => {
     const list = parseAddressList(c.req.query("addresses"));
     if (!list) {
+      c.header("cache-control", "no-store");
       return c.json({ error: "invalid_addresses", message: "addresses must be 1 to 10 comma-separated base58 Solana addresses.", retryable: false }, 400);
     }
+    c.header("cache-control", "private, no-store");
     return c.json(await quickBatch(list));
   });
 
@@ -386,9 +475,12 @@ export async function createApp(options: CreateAppOptions = {}) {
     }
     try {
       const hit = await quickLoad(address);
-      return c.json({ ...quickOf(hit.value), cached: hit.cached, stale: hit.stale });
+      c.header("cache-control", "private, no-store");
+      return c.json({ ...quickOf(hit.value), ...cacheMeta(hit) });
     } catch (error) {
       const failure = publicFailure(error, "Wallet lookup failed");
+      if (failure.retryAfter) c.header("retry-after", String(failure.retryAfter));
+      c.header("cache-control", "no-store");
       return c.json(failure.body, failure.status);
     }
   });
@@ -400,9 +492,12 @@ export async function createApp(options: CreateAppOptions = {}) {
     }
     try {
       const hit = await cache.getOrSet(`preview:${env.walletCluster}:${address}`, 30_000, () => loadPreview(env, address));
-      return c.json(hit.value as Record<string, unknown>);
+      c.header("cache-control", "public, max-age=15, s-maxage=30, stale-while-revalidate=120");
+      return c.json({ ...(hit.value as Record<string, unknown>), ...cacheMeta(hit) });
     } catch (error) {
       const failure = publicFailure(error, "Wallet preview failed");
+      if (failure.retryAfter) c.header("retry-after", String(failure.retryAfter));
+      c.header("cache-control", "no-store");
       return c.json(failure.body, failure.status);
     }
   });
@@ -415,17 +510,21 @@ export async function createApp(options: CreateAppOptions = {}) {
         400,
       );
     }
-    const txLimit = clampInt(c.req.query("txLimit"), 20, 5, 25);
+    const txLimit = parseBoundedInt(c.req.query("txLimit"), 20, 5, 25);
     if (txLimit === null) {
+      c.header("cache-control", "no-store");
       return c.json({ error: "invalid_tx_limit", message: "txLimit must be an integer from 5 to 25.", retryable: false }, 400);
     }
     try {
       const hit = await cache.getOrSet(`wallet:${env.walletCluster}:${address}:${txLimit}`, 60_000, () =>
         loadWallet(env, address, txLimit),
       );
-      return c.json({ ...hit.value, cached: hit.cached, stale: hit.stale });
+      c.header("cache-control", "private, no-store");
+      return c.json({ ...hit.value, ...cacheMeta(hit) });
     } catch (error) {
       const failure = publicFailure(error, "Wallet lookup failed");
+      if (failure.retryAfter) c.header("retry-after", String(failure.retryAfter));
+      c.header("cache-control", "no-store");
       return c.json(failure.body, failure.status);
     }
   });
@@ -446,25 +545,32 @@ export async function createApp(options: CreateAppOptions = {}) {
       const hit = await cache.getOrSet(`funding:${env.walletCluster}:${address}:${peers.peers.join(",")}`, 60_000, () =>
         loadFunding(env, address, peers.peers),
       );
-      return c.json({ ...hit.value, cached: hit.cached, stale: hit.stale });
+      c.header("cache-control", "private, no-store");
+      return c.json({ ...hit.value, ...cacheMeta(hit) });
     } catch (error) {
       const failure = publicFailure(error, "Funding lookup failed");
+      if (failure.retryAfter) c.header("retry-after", String(failure.retryAfter));
+      c.header("cache-control", "no-store");
       return c.json(failure.body, failure.status);
     }
   });
 
   app.get("/token/trending", async (c) => {
-    const limit = clampInt(c.req.query("limit"), 15, 1, 25);
+    const limit = parseBoundedInt(c.req.query("limit"), 15, 1, 25);
     if (limit === null) {
+      c.header("cache-control", "no-store");
       return c.json({ error: "invalid_limit", message: "limit must be an integer from 1 to 25.", retryable: false }, 400);
     }
     try {
       const hit = await cache.getOrSet(`trending:${limit}:${Boolean(env.birdeyeApiKey)}`, 60_000, () =>
         loadTrendingTokens(env, limit),
       );
-      return c.json({ ...hit.value, cached: hit.cached, stale: hit.stale });
+      c.header("cache-control", "private, no-store");
+      return c.json({ ...hit.value, ...cacheMeta(hit) });
     } catch (error) {
       const failure = publicFailure(error, "Trending lookup failed");
+      if (failure.retryAfter) c.header("retry-after", String(failure.retryAfter));
+      c.header("cache-control", "no-store");
       return c.json(failure.body, failure.status);
     }
   });
@@ -505,13 +611,66 @@ export async function createApp(options: CreateAppOptions = {}) {
     return paid;
   }
 
+  const addressField = z
+    .string()
+    .describe("Solana wallet address in base58 (32 to 44 characters). Example: HD1ryR3dYSXBVNGfJZydbpmnChiE1wrAQkupWWtHt4pM")
+    .refine((value) => isSolanaAddress(value.trim()), { message: "Query address must be a Solana base58 public key." });
+  const txLimitField = z
+    .union([
+      z.number().int().min(5).max(25),
+      z
+        .string()
+        .regex(/^\d+$/)
+        .refine((value) => {
+          const parsed = Number(value);
+          return parsed >= 5 && parsed <= 25;
+        }, "txLimit must be an integer from 5 to 25."),
+    ])
+    .optional()
+    .describe("Recent signatures to inspect. Integer from 5 to 25, or a numeric string. Default 20.");
+  const limitField = z
+    .union([
+      z.number().int().min(1).max(25),
+      z
+        .string()
+        .regex(/^\d+$/)
+        .refine((value) => {
+          const parsed = Number(value);
+          return parsed >= 1 && parsed <= 25;
+        }, "limit must be an integer from 1 to 25."),
+    ])
+    .optional()
+    .describe("How many tokens to return. Integer from 1 to 25, or a numeric string. Default 15.");
+
   app.all("/mcp", async (c) => {
-    // Stateless server: no standalone SSE stream. Open GETs otherwise hang until the 300s function timeout.
-    if (c.req.method === "GET") return c.json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed. POST JSON-RPC to /mcp." }, id: null }, 405, { Allow: "POST" });
-    const mcp = new McpServer({ name: "solana-wallet-x402", version: "1.0.0" });
-    mcp.tool("ping", "Free health check. Does not spend USDC.", {}, async () => ({
-      content: [{ type: "text", text: "pong" }],
-    }));
+    // Stateless server: no standalone SSE stream. Open GETs otherwise hang until the function timeout.
+    if (c.req.method === "GET") {
+      c.header("cache-control", "no-store");
+      return c.json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed. POST JSON-RPC to /mcp." }, id: null }, 405, { Allow: "POST" });
+    }
+    const mcp = new McpServer({ name: "solana-wallet-x402", version: SERVICE_VERSION });
+    mcp.tool(
+      "ping",
+      "Free health check. Does not spend USDC. Confirms the MCP server is up and does not read a wallet.",
+      {},
+      READ_ONLY,
+      async () => ({ content: [{ type: "text", text: "pong" }] }),
+    );
+    mcp.tool(
+      FREE_WALLET_PREVIEW.mcpTool,
+      FREE_WALLET_PREVIEW.description,
+      { address: addressField },
+      READ_ONLY,
+      async ({ address }: { address: string }) => {
+        const wallet = address.trim();
+        try {
+          const hit = await cache.getOrSet(`preview:${env.walletCluster}:${wallet}`, 30_000, () => loadPreview(env, wallet));
+          return toolJson({ ...(hit.value as Record<string, unknown>), ...cacheMeta(hit) });
+        } catch (error) {
+          return toolError(publicFailure(error, "Wallet preview failed").body);
+        }
+      },
+    );
 
     const walletOp = operations.find((operation) => operation.id === "wallet_profile");
     const trendingOp = operations.find((operation) => operation.id === "token_trending");
@@ -525,81 +684,69 @@ export async function createApp(options: CreateAppOptions = {}) {
 
     const walletPaid = await wrapperFor(walletOp).catch(() => null);
     const walletHandler = walletPaid
-      ? walletPaid(async ({ address }: { address: string }) => {
-          if (!isSolanaAddress(address)) {
-            return { isError: true, content: [{ type: "text" as const, text: "Query address must be a Solana base58 public key." }] };
+      ? walletPaid(async ({ address, txLimit }: { address: string; txLimit?: string | number }) => {
+          const wallet = address.trim();
+          const parsed = parseBoundedInt(txLimit, 20, 5, 25);
+          if (parsed === null) {
+            return toolError({ error: "invalid_tx_limit", message: "txLimit must be an integer from 5 to 25.", retryable: false });
           }
           try {
-            const hit = await cache.getOrSet(`wallet:${env.walletCluster}:${address}:20`, 60_000, () => loadWallet(env, address, 20));
-            return { content: [{ type: "text" as const, text: JSON.stringify({ ...hit.value, cached: hit.cached, stale: hit.stale }) }] };
+            const hit = await cache.getOrSet(`wallet:${env.walletCluster}:${wallet}:${parsed}`, 60_000, () => loadWallet(env, wallet, parsed));
+            return toolJson({ ...hit.value, ...cacheMeta(hit) });
           } catch (error) {
-            const failure = publicFailure(error, "Wallet lookup failed");
-            return { isError: true, content: [{ type: "text" as const, text: JSON.stringify(failure.body) }] };
+            return toolError(publicFailure(error, "Wallet lookup failed").body);
           }
         })
       : unpaidTool;
-    mcp.tool(
-      walletOp.mcpTool,
-      `${walletOp.description} Costs ${walletOp.price} USDC.`,
-      { address: z.string().describe("Solana wallet address") },
-      walletHandler,
-    );
+    mcp.tool(walletOp.mcpTool, mcpToolDescription(walletOp), { address: addressField, txLimit: txLimitField }, READ_ONLY, walletHandler);
 
     const trendingPaid = await wrapperFor(trendingOp).catch(() => null);
     const trendingHandler = trendingPaid
-      ? trendingPaid(async ({ limit }: { limit?: string }) => {
-          const parsed = clampInt(limit, 15, 1, 25);
+      ? trendingPaid(async ({ limit }: { limit?: string | number }) => {
+          const parsed = parseBoundedInt(limit, 15, 1, 25);
           if (parsed === null) {
-            return { isError: true, content: [{ type: "text" as const, text: "limit must be an integer from 1 to 25." }] };
+            return toolError({ error: "invalid_limit", message: "limit must be an integer from 1 to 25.", retryable: false });
           }
           try {
             const hit = await cache.getOrSet(`trending:${parsed}:${Boolean(env.birdeyeApiKey)}`, 60_000, () =>
               loadTrendingTokens(env, parsed),
             );
-            return { content: [{ type: "text" as const, text: JSON.stringify({ ...hit.value, cached: hit.cached, stale: hit.stale }) }] };
+            return toolJson({ ...hit.value, ...cacheMeta(hit) });
           } catch (error) {
-            const failure = publicFailure(error, "Trending lookup failed");
-            return { isError: true, content: [{ type: "text" as const, text: JSON.stringify(failure.body) }] };
+            return toolError(publicFailure(error, "Trending lookup failed").body);
           }
         })
       : unpaidTool;
-    mcp.tool(
-      trendingOp.mcpTool,
-      `${trendingOp.description} Costs ${trendingOp.price} USDC.`,
-      { limit: z.string().optional().describe("1 to 25, default 15") },
-      trendingHandler,
-    );
+    mcp.tool(trendingOp.mcpTool, mcpToolDescription(trendingOp), { limit: limitField }, READ_ONLY, trendingHandler);
 
     const fundingPaid = await wrapperFor(fundingOp).catch(() => null);
     const fundingHandler = fundingPaid
       ? fundingPaid(async ({ address, peers }: { address: string; peers?: string }) => {
-          if (!isSolanaAddress(address)) {
-            return { isError: true, content: [{ type: "text" as const, text: "Query address must be a Solana base58 public key." }] };
-          }
-          const parsed = parsePeerList(peers, address);
+          const wallet = address.trim();
+          const parsed = parsePeerList(peers, wallet);
           if ("error" in parsed) {
-            return { isError: true, content: [{ type: "text" as const, text: parsed.error }] };
+            return toolError({ error: "invalid_peers", message: parsed.error, retryable: false });
           }
           try {
             const hit = await cache.getOrSet(
-              `funding:${env.walletCluster}:${address}:${parsed.peers.join(",")}`,
+              `funding:${env.walletCluster}:${wallet}:${parsed.peers.join(",")}`,
               60_000,
-              () => loadFunding(env, address, parsed.peers),
+              () => loadFunding(env, wallet, parsed.peers),
             );
-            return { content: [{ type: "text" as const, text: JSON.stringify({ ...hit.value, cached: hit.cached, stale: hit.stale }) }] };
+            return toolJson({ ...hit.value, ...cacheMeta(hit) });
           } catch (error) {
-            const failure = publicFailure(error, "Funding lookup failed");
-            return { isError: true, content: [{ type: "text" as const, text: JSON.stringify(failure.body) }] };
+            return toolError(publicFailure(error, "Funding lookup failed").body);
           }
         })
       : unpaidTool;
     mcp.tool(
       fundingOp.mcpTool,
-      `${fundingOp.description} Costs ${fundingOp.price} USDC.`,
+      mcpToolDescription(fundingOp),
       {
-        address: z.string().describe("Solana wallet address"),
-        peers: z.string().optional().describe("Comma-separated peer wallets, up to 8"),
+        address: addressField,
+        peers: z.string().optional().describe("Comma-separated peer wallets, up to 8. Do not repeat the primary address."),
       },
+      READ_ONLY,
       fundingHandler,
     );
 
@@ -608,19 +755,40 @@ export async function createApp(options: CreateAppOptions = {}) {
       const quickPaid = await wrapperFor(quickOp).catch(() => null);
       const quickHandler = quickPaid
         ? quickPaid(async ({ address }: { address: string }) => {
-            if (!isSolanaAddress(address)) {
-              return { isError: true, content: [{ type: "text" as const, text: "Query address must be a Solana base58 public key." }] };
-            }
             try {
-              const hit = await quickLoad(address);
-              return { content: [{ type: "text" as const, text: JSON.stringify({ ...quickOf(hit.value), cached: hit.cached, stale: hit.stale }) }] };
+              const hit = await quickLoad(address.trim());
+              return toolJson({ ...quickOf(hit.value), ...cacheMeta(hit) });
             } catch (error) {
-              const failure = publicFailure(error, "Wallet lookup failed");
-              return { isError: true, content: [{ type: "text" as const, text: JSON.stringify(failure.body) }] };
+              return toolError(publicFailure(error, "Wallet lookup failed").body);
             }
           })
         : unpaidTool;
-      mcp.tool(quickOp.mcpTool, `${quickOp.description} Costs ${quickOp.price} USDC.`, { address: z.string().describe("Solana wallet address") }, quickHandler);
+      mcp.tool(quickOp.mcpTool, mcpToolDescription(quickOp), { address: addressField }, READ_ONLY, quickHandler);
+    }
+
+    const batchOp = operations.find((operation) => operation.id === "wallet_quick_batch");
+    if (batchOp) {
+      const batchPaid = await wrapperFor(batchOp).catch(() => null);
+      const batchHandler = batchPaid
+        ? batchPaid(async ({ addresses }: { addresses: string }) => {
+            const list = parseAddressList(addresses);
+            if (!list) {
+              return toolError({
+                error: "invalid_addresses",
+                message: "addresses must be 1 to 10 comma-separated base58 Solana addresses.",
+                retryable: false,
+              });
+            }
+            return toolJson(await quickBatch(list));
+          })
+        : unpaidTool;
+      mcp.tool(
+        batchOp.mcpTool,
+        mcpToolDescription(batchOp),
+        { addresses: z.string().describe("1 to 10 comma-separated base58 Solana wallet addresses.") },
+        READ_ONLY,
+        batchHandler,
+      );
     }
 
     const transport = new WebStandardStreamableHTTPServerTransport({
@@ -671,6 +839,35 @@ export async function createApp(options: CreateAppOptions = {}) {
       });
     }
   }
+
+  app.notFound((c) => {
+    c.header("cache-control", "no-store");
+    return c.json(
+      {
+        error: "not_found",
+        message: "That path is not served. Read /llms.txt or /.well-known/x402 for the live routes.",
+        retryable: false,
+        paths: [
+          "/wallet/preview",
+          "/wallet/quick",
+          "/wallet/quick/batch",
+          "/wallet/profile",
+          "/wallet/funding",
+          "/token/trending",
+          "/mcp",
+          "/health",
+        ],
+      },
+      404,
+    );
+  });
+
+  app.onError((error, c) => {
+    const failure = publicFailure(error, "Request failed");
+    if (failure.retryAfter) c.header("retry-after", String(failure.retryAfter));
+    c.header("cache-control", "no-store");
+    return c.json(failure.body, failure.status);
+  });
 
   return { app, env, accepts: activeAccepts, operations };
 }

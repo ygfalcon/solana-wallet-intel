@@ -12,6 +12,8 @@ import {
   type TradeLeg,
 } from "../analytics.js";
 import { fetchJson, redactSecrets, UpstreamError } from "../http.js";
+import { mapPool } from "../pool.js";
+import { solanaRpc } from "../solana-rpc.js";
 import {
   accumulateHoldings,
   holdingFromAsset,
@@ -185,38 +187,25 @@ export function legsFromHelius(tx: HeliusTx, owner: string): TradeLeg[] {
   return netLegs(legs);
 }
 
-async function rpc<T>(url: string, method: string, params: unknown[]): Promise<T> {
-  const body = await fetchJson<RpcResponse<T>>(url, {
-    source: "solana-rpc",
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: method, method, params }),
-  });
-  if (body.error) throw new UpstreamError(body.error.message ?? "RPC error", "solana-rpc");
-  return body.result as T;
-}
-
 async function loadRpcActivity(env: AppEnv, address: string, txLimit: number) {
-  const signatures = await rpc<Array<{ signature: string; blockTime: number | null; err?: unknown }>>(
-    env.solanaRpcUrl,
+  const signatures = await solanaRpc<Array<{ signature: string; blockTime: number | null; err?: unknown }>>(
+    env,
     "getSignaturesForAddress",
     [address, { limit: txLimit }],
   );
   const rows = signatures ?? [];
-  const transactions = await Promise.all(
-    rows.slice(0, txLimit).map(async (item) => {
-      if (item.err) return { legs: [] as TradeLeg[], blockTime: item.blockTime };
-      try {
-        const tx = await rpc<ParsedTx | null>(env.solanaRpcUrl, "getTransaction", [
-          item.signature,
-          { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 },
-        ]);
-        return { legs: tx ? legsFromParsedTransaction(tx, address) : [], blockTime: item.blockTime };
-      } catch {
-        return { legs: [] as TradeLeg[], blockTime: item.blockTime };
-      }
-    }),
-  );
+  const transactions = await mapPool(rows.slice(0, txLimit), 4, async (item) => {
+    if (item.err) return { legs: [] as TradeLeg[], blockTime: item.blockTime };
+    try {
+      const tx = await solanaRpc<ParsedTx | null>(env, "getTransaction", [
+        item.signature,
+        { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 },
+      ]);
+      return { legs: tx ? legsFromParsedTransaction(tx, address) : [], blockTime: item.blockTime };
+    } catch {
+      return { legs: [] as TradeLeg[], blockTime: item.blockTime };
+    }
+  });
   const trades: TimedTrade[] = transactions
     .filter((item) => item.legs.length > 0)
     .map((item) => ({ at: item.blockTime, legs: item.legs }));
@@ -314,13 +303,13 @@ function holdingFromRpcAccount(account: TokenAccountResponse["value"][number]): 
 
 async function loadRpcHoldings(env: AppEnv, address: string): Promise<RawHolding[]> {
   const [lamports, tokenAccounts, token2022] = await Promise.all([
-    rpc<number>(env.solanaRpcUrl, "getBalance", [address]),
-    rpc<TokenAccountResponse>(env.solanaRpcUrl, "getTokenAccountsByOwner", [
+    solanaRpc<number>(env, "getBalance", [address]),
+    solanaRpc<TokenAccountResponse>(env, "getTokenAccountsByOwner", [
       address,
       { programId: TOKEN_PROGRAM },
       { encoding: "jsonParsed" },
     ]),
-    rpc<TokenAccountResponse>(env.solanaRpcUrl, "getTokenAccountsByOwner", [
+    solanaRpc<TokenAccountResponse>(env, "getTokenAccountsByOwner", [
       address,
       { programId: TOKEN_2022_PROGRAM },
       { encoding: "jsonParsed" },
@@ -346,7 +335,7 @@ async function loadHoldings(env: AppEnv, address: string) {
       warnings.push(...das.warnings);
       if (!das.sawNativeBalance) {
         try {
-          const lamports = await rpc<number>(env.solanaRpcUrl, "getBalance", [address]);
+          const lamports = await solanaRpc<number>(env, "getBalance", [address]);
           const sol = nativeSolHolding(lamports);
           if (sol) das.items.push(sol);
           sources.push("solana-rpc");
@@ -362,7 +351,7 @@ async function loadHoldings(env: AppEnv, address: string) {
 
   sources.push("solana-rpc");
   if (!env.heliusApiKey) {
-    warnings.push("HELIUS_API_KEY is unset. Holdings and recent swaps come from the public Solana RPC.");
+    warnings.push("Holdings and recent swaps come from public Solana RPC endpoints.");
   }
   const items = await loadRpcHoldings(env, address);
   return { items, sources, warnings };
@@ -392,29 +381,32 @@ function stampExecutionPrices(
   return missingSol;
 }
 
+async function loadActivity(env: AppEnv, address: string, txLimit: number) {
+  const warnings: string[] = [];
+  try {
+    const activity = env.heliusApiKey
+      ? await loadHeliusActivity(env, address, txLimit)
+      : await loadRpcActivity(env, address, txLimit);
+    return { activity, warnings };
+  } catch (error) {
+    if (!env.heliusApiKey) throw error;
+    warnings.push(redactSecrets(error instanceof Error ? error.message : "Helius history failed"));
+    return { activity: await loadRpcActivity(env, address, txLimit), warnings };
+  }
+}
+
 export async function buildWalletProfile(
   env: AppEnv,
   address: string,
   txLimit: number,
 ): Promise<Omit<WalletProfile, "cached" | "stale">> {
-  const warnings: string[] = [];
-  const sources: string[] = [];
-  let activity: { trades: TimedTrade[]; signatureCount: number; times: number[]; source: string };
-  try {
-    activity = env.heliusApiKey
-      ? await loadHeliusActivity(env, address, txLimit)
-      : await loadRpcActivity(env, address, txLimit);
-    sources.push(activity.source);
-  } catch (error) {
-    if (!env.heliusApiKey) throw error;
-    warnings.push(redactSecrets(error instanceof Error ? error.message : "Helius history failed"));
-    activity = await loadRpcActivity(env, address, txLimit);
-    sources.push(activity.source);
-  }
-
-  const holdingResult = await loadHoldings(env, address);
-  sources.push(...holdingResult.sources);
-  warnings.push(...holdingResult.warnings);
+  const [activityResult, holdingResult] = await Promise.all([
+    loadActivity(env, address, txLimit),
+    loadHoldings(env, address),
+  ]);
+  const activity = activityResult.activity;
+  const warnings = [...activityResult.warnings, ...holdingResult.warnings];
+  const sources = [activity.source, ...holdingResult.sources];
   const merged = accumulateHoldings(holdingResult.items);
 
   const usesSol = activity.trades.some((trade) => trade.legs.some((leg) => leg.mint === SOL_MINT));

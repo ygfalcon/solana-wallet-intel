@@ -112,7 +112,7 @@ describe("x402 paywall", () => {
     );
   });
 
-  it("prices trending tokens at 5000 USDC base units", async () => {
+  it("prices trending tokens at 1800 USDC base units", async () => {
     const { app } = await testApp();
     const response = await app.request("http://127.0.0.1:4021/token/trending");
     expect(response.status).toBe(402);
@@ -172,7 +172,11 @@ describe("x402 paywall", () => {
     expect(discovery.mcp.tools.map((tool: { name: string }) => tool.name)).toContain("wallet_funding");
     expect(discovery.facilitators.base.provider).toBe("public");
     expect(discovery.mcp.url).toBe("http://127.0.0.1:4021/mcp");
-    expect(discovery.sla.version).toBe("1.0.0");
+    expect(discovery.sla.version).toBe("1.1.0");
+    expect(discovery.free[0].mcpTool).toBe("wallet_preview");
+    expect(discovery.mcp.tools.map((tool: { name: string }) => tool.name)).toEqual(
+      expect.arrayContaining(["ping", "wallet_preview", "wallet_profile", "wallet_quick", "wallet_quick_batch", "wallet_funding", "token_trending"]),
+    );
     expect(discovery.sla.latency.p50Ms).toEqual(expect.any(Number));
     expect(discovery.sla.latency.p95Ms).toEqual(expect.any(Number));
     expect(discovery.sla.upstream.status).toBe("unknown");
@@ -324,7 +328,7 @@ describe("x402 paywall", () => {
     const body = await response.json();
     expect(body.ok).toBe(true);
     expect(body.accepts.map((accept: { chain: string }) => accept.chain)).toEqual(["solana", "base"]);
-    expect(body.sla.version).toBe("1.0.0");
+    expect(body.sla.version).toBe("1.1.0");
     expect(body.sla.windowMs).toBe(300_000);
     expect(body.sla.latency).toEqual({ p50Ms: null, p95Ms: null, samples: 0 });
     expect(body.sla.upstream.status).toBe("unknown");
@@ -389,13 +393,23 @@ describe("x402 paywall", () => {
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
     });
     expect(listed.status).toBe(200);
-    const tools = (await listed.json()).result.tools as Array<{ name: string; description: string }>;
+    const tools = (await listed.json()).result.tools as Array<{
+      name: string;
+      description: string;
+      annotations?: { readOnlyHint?: boolean };
+    }>;
     const funding = tools.find((tool) => tool.name === "wallet_funding");
     expect(funding?.description).toMatch(/first SOL funder/i);
     expect(funding?.description).toContain("$0.009");
     expect(funding?.description).toMatch(/cluster/i);
     expect(tools.find((tool) => tool.name === "wallet_profile")?.description).toContain("$0.009");
     expect(tools.find((tool) => tool.name === "ping")?.description).toMatch(/free/i);
+    const preview = tools.find((tool) => tool.name === "wallet_preview");
+    expect(preview?.description).toMatch(/free/i);
+    expect(preview?.description).toMatch(/before any paid wallet tool/i);
+    expect(preview?.annotations).toMatchObject({ readOnlyHint: true });
+    expect(tools.find((tool) => tool.name === "wallet_profile")?.description).toMatch(/txLimit/);
+    expect(tools.find((tool) => tool.name === "token_trending")?.description).toMatch(/1 to 25/);
 
     const called = await app.request("http://127.0.0.1:4021/mcp", {
       method: "POST",
@@ -433,7 +447,13 @@ describe("quick and preview routes", () => {
     expect(body.accepts[0].amount).toBe("2000");
     const p = await app.request(`/wallet/preview?address=${addr}`);
     expect(p.status).toBe(200);
-    expect((await p.json()).preview).toBe(true);
+    expect(p.headers.get("cache-control")).toContain("s-maxage=30");
+    const previewBody = await p.json();
+    expect(previewBody.preview).toBe(true);
+    expect(previewBody.cached).toBe(false);
+    const again = await app.request(`/wallet/preview?address=${addr}`);
+    expect((await again.json()).cached).toBe(true);
     expect((await app.request(`/wallet/preview?address=bad`)).status).toBe(400);
+    expect((await app.request(`/wallet/quick?address=${addr}`)).headers.get("cache-control")).toBe("no-store");
   });
 });

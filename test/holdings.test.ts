@@ -16,6 +16,7 @@ describe("holdings", () => {
   it("reads uiAmountString when uiAmount is null and ignores NFT-shaped accounts", () => {
     expect(parseUiAmount({ uiAmount: null, uiAmountString: "500.5", decimals: 6 }).amount).toBe(500.5);
     expect(parseUiAmount({ uiAmount: null, amount: "1000000", decimals: 6 }).amount).toBe(1);
+    expect(parseUiAmount({ amount: "123456789012345678", decimals: 8 }).amount).toBe(1234567890.12345678);
 
     const merged = accumulateHoldings([
       { mint: BONK, amount: 500, symbol: "BONK", name: "Bonk", priceHint: null, decimals: 5 },

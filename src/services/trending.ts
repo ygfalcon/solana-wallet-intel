@@ -1,7 +1,7 @@
 import { QUOTE_MINTS, type AppEnv } from "../config.js";
 import { rankScore, riskFlags } from "../analytics.js";
 import { fetchJson } from "../http.js";
-import { createPublicRpc } from "../public-rpc.js";
+import { sharedPublicRpc } from "../public-rpc.js";
 import type { TokenChecks } from "../token-risk.js";
 import { chooseLiquidPair, positiveUsd, type DexPair } from "./prices.js";
 import { enrichTrendingTokens } from "./token-safety.js";
@@ -215,7 +215,7 @@ export async function loadTrending(env: AppEnv, limit: number): Promise<Omit<Tre
   }
 
   const assembled = assembleTrending({ pairs: pairs ?? [], boosted, birdeye, limit, sources, warnings });
-  const tokens = await enrichTrendingTokens(assembled.tokens, createPublicRpc());
+  const tokens = await enrichTrendingTokens(assembled.tokens, sharedPublicRpc());
   return {
     ...assembled,
     tokens,

@@ -1,6 +1,8 @@
 import { base58 } from "@scure/base";
 
 export function isSolanaAddress(value: string): boolean {
+  // A 32-byte key encodes to 32–44 base58 characters. Reject other lengths before decoding.
+  if (value.length < 32 || value.length > 44) return false;
   try {
     return base58.decode(value).length === 32;
   } catch {

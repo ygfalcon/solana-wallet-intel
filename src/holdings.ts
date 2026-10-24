@@ -43,11 +43,28 @@ export function parseUiAmount(token?: TokenAmount | null): { amount: number; dec
     if (Number.isFinite(value)) return { amount: value, decimals };
   }
   if (typeof token.uiAmount === "number" && Number.isFinite(token.uiAmount)) return { amount: token.uiAmount, decimals };
-  if (token.amount != null && decimals != null && decimals >= 0) {
-    const raw = Number(token.amount);
-    if (Number.isFinite(raw)) return { amount: raw / 10 ** decimals, decimals };
+  if (token.amount != null && decimals != null && decimals >= 0 && decimals <= 18) {
+    const parsed = amountFromRaw(token.amount, decimals);
+    if (parsed != null) return { amount: parsed, decimals };
   }
   return { amount: 0, decimals };
+}
+
+/** Divide an integer token amount in decimal scale without rounding through Number first. */
+function amountFromRaw(amount: string | number, decimals: number): number | null {
+  const text = String(amount).trim();
+  if (!/^\d+$/.test(text)) return null;
+  try {
+    const raw = BigInt(text);
+    const scale = 10n ** BigInt(decimals);
+    const whole = raw / scale;
+    const frac = raw % scale;
+    const rendered = frac === 0n ? whole.toString() : `${whole}.${frac.toString().padStart(decimals, "0").replace(/0+$/, "")}`;
+    const value = Number(rendered);
+    return Number.isFinite(value) ? value : null;
+  } catch {
+    return null;
+  }
 }
 
 export function isLikelyNft(decimals: number | null | undefined, amount: number): boolean {
