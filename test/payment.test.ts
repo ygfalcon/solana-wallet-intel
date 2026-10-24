@@ -98,14 +98,14 @@ describe("x402 paywall", () => {
         expect.objectContaining({
           scheme: "exact",
           network: SOLANA_DEVNET,
-          amount: "10000",
+          amount: "9000",
           asset: USDC_SOLANA_DEVNET,
           payTo: "HD1ryR3dYSXBVNGfJZydbpmnChiE1wrAQkupWWtHt4pM",
         }),
         expect.objectContaining({
           scheme: "exact",
           network: BASE_SEPOLIA,
-          amount: "10000",
+          amount: "9000",
           asset: USDC_BASE_SEPOLIA,
         }),
       ]),
@@ -117,7 +117,7 @@ describe("x402 paywall", () => {
     const response = await app.request("http://127.0.0.1:4021/token/trending");
     expect(response.status).toBe(402);
     const body = await response.json();
-    expect(body.accepts.every((accept: { amount: string }) => accept.amount === "5000")).toBe(true);
+    expect(body.accepts.every((accept: { amount: string }) => accept.amount === "1800")).toBe(true);
     expect(body.inputSchema.properties.limit.type).toBe("string");
   });
 
@@ -126,16 +126,16 @@ describe("x402 paywall", () => {
     const spec = await (await app.request("http://127.0.0.1:4021/openapi.json")).json();
     expect(spec.paths["/wallet/profile"].get["x-payment-info"]).toMatchObject({
       protocol: "x402",
-      price: "$0.01",
-      amount: "10000",
+      price: "$0.009",
+      amount: "9000",
       currency: "USDC",
     });
     expect(spec.paths["/wallet/profile"].get.responses["402"]).toBeTruthy();
-    expect(spec.paths["/token/trending"].get["x-payment-info"].amount).toBe("5000");
+    expect(spec.paths["/token/trending"].get["x-payment-info"].amount).toBe("1800");
     expect(spec.paths["/wallet/funding"].get["x-payment-info"]).toMatchObject({
       protocol: "x402",
-      price: "$0.02",
-      amount: "20000",
+      price: "$0.009",
+      amount: "9000",
       currency: "USDC",
     });
     expect(spec.paths["/wallet/funding"].get.responses["402"]).toBeTruthy();
@@ -152,7 +152,7 @@ describe("x402 paywall", () => {
     ]);
     expect(healthSchema.properties.sla.properties.cache.properties.ageMs).toBeTruthy();
     expect(spec.info.description).toMatch(/holder concentration/i);
-    expect(spec.info.description).toMatch(/\$0\.005/);
+    expect(spec.info.description).toMatch(/\$0\.0018/);
     expect(spec.paths["/token/trending"].get.description).toMatch(/top-10 share/i);
     expect(spec.paths["/token/trending"].get.responses["200"].content["application/json"].example.tokens[0].checks.lp.status).toBe(
       "burned",
@@ -161,11 +161,11 @@ describe("x402 paywall", () => {
     const discovery = await (await app.request("http://127.0.0.1:4021/.well-known/x402")).json();
     expect(discovery.protocol).toBe("x402");
     expect(discovery.resources).toHaveLength(5);
-    expect(discovery.resources[0].accepts[0].amount).toBe("10000");
-    expect(discovery.resources.find((resource: { path: string }) => resource.path === "/token/trending").amount).toBe("5000");
+    expect(discovery.resources[0].accepts[0].amount).toBe("9000");
+    expect(discovery.resources.find((resource: { path: string }) => resource.path === "/token/trending").amount).toBe("1800");
     const funding = discovery.resources.find((resource: { path: string }) => resource.path === "/wallet/funding");
-    expect(funding.price).toBe("$0.02");
-    expect(funding.amount).toBe("20000");
+    expect(funding.price).toBe("$0.009");
+    expect(funding.amount).toBe("9000");
     expect(funding.inputSchema.required).toContain("address");
     expect(funding.inputSchema.properties.peers.type).toBe("string");
     expect(funding.description).toMatch(/first SOL funder/i);
@@ -180,8 +180,8 @@ describe("x402 paywall", () => {
     expect(discovery.pricingNotes).toEqual([
       expect.objectContaining({
         path: "/token/trending",
-        price: "$0.005",
-        amount: "5000",
+        price: "$0.0018",
+        amount: "1800",
         checks: expect.arrayContaining([
           "top-10 holder share",
           "mint and freeze authority",
@@ -192,7 +192,7 @@ describe("x402 paywall", () => {
     ]);
     expect(JSON.stringify(discovery.pricingNotes)).not.toContain("$0.002");
     expect(discovery.resources.find((resource: { path: string }) => resource.path === "/token/trending").amount).toBe(
-      "5000",
+      "1800",
     );
 
     const llms = await app.request("http://127.0.0.1:4021/llms.txt");
@@ -200,13 +200,13 @@ describe("x402 paywall", () => {
     expect(llms.headers.get("content-type")).toContain("text/plain");
     const llmsBody = await llms.text();
     expect(llmsBody).toContain("http://127.0.0.1:4021/wallet/funding");
-    expect(llmsBody).toContain("$0.02");
+    expect(llmsBody).toContain("$0.009");
     expect(llmsBody).toContain("wallet_funding");
     expect(llmsBody).toMatch(/p50/);
     expect(llmsBody).toMatch(/p95/);
     expect(llmsBody).toMatch(/rate-limit/i);
     expect(llmsBody).toMatch(/cache age/i);
-    expect(llmsBody).toContain("$0.005");
+    expect(llmsBody).toContain("$0.0018");
     expect(llmsBody).toContain("top-10 share");
     expect(llmsBody).not.toMatch(/token\/trending\): \$0\.002/);
   });
@@ -231,7 +231,7 @@ describe("x402 paywall", () => {
     const profile = await paid.json();
     expect(profile.labels).toContain("active memecoin trader");
     expect(facilitator.settleCalls).toHaveLength(1);
-    expect(facilitator.settleCalls[0].amount).toBe("10000");
+    expect(facilitator.settleCalls[0].amount).toBe("9000");
 
     const rejected = await app.request("http://127.0.0.1:4021/wallet/profile?address=not-a-wallet", {
       headers: { "PAYMENT-SIGNATURE": header },
@@ -313,7 +313,7 @@ describe("x402 paywall", () => {
     const payload = await response.json();
     expect(payload.result.isError).toBe(true);
     const payment = JSON.parse(payload.result.content[0].text);
-    expect(payment.accepts.some((accept: { amount: string }) => accept.amount === "10000")).toBe(true);
+    expect(payment.accepts.some((accept: { amount: string }) => accept.amount === "9000")).toBe(true);
     expect(payment.extensions.bazaar.info.input.toolName).toBe("wallet_profile");
   });
 
@@ -338,14 +338,14 @@ describe("x402 paywall", () => {
     expect(after.sla.latency.p50Ms).toBeGreaterThanOrEqual(0);
   });
 
-  it("prices funding and cluster lookup at 20000 USDC base units", async () => {
+  it("prices funding and cluster lookup at 9000 USDC base units", async () => {
     const { app, facilitator } = await testApp();
     const unpaid = await app.request(
       "http://127.0.0.1:4021/wallet/funding?address=HD1ryR3dYSXBVNGfJZydbpmnChiE1wrAQkupWWtHt4pM",
     );
     expect(unpaid.status).toBe(402);
     const required = await unpaid.json();
-    expect(required.accepts.every((accept: { amount: string }) => accept.amount === "20000")).toBe(true);
+    expect(required.accepts.every((accept: { amount: string }) => accept.amount === "9000")).toBe(true);
     expect(required.inputSchema.properties.address.type).toBe("string");
     expect(required.inputSchema.properties.peers.description).toMatch(/8/);
     const accepted = required.accepts.find((accept: { network: string }) => accept.network === SOLANA_DEVNET);
@@ -364,7 +364,7 @@ describe("x402 paywall", () => {
     const body = await paid.json();
     expect(body.cluster.id).toContain("funder:");
     expect(body.summary).toMatch(/funder/i);
-    expect(facilitator.settleCalls.at(-1)?.amount).toBe("20000");
+    expect(facilitator.settleCalls.at(-1)?.amount).toBe("9000");
 
     const badPeers = await app.request(
       "http://127.0.0.1:4021/wallet/funding?address=HD1ryR3dYSXBVNGfJZydbpmnChiE1wrAQkupWWtHt4pM&peers=not-a-wallet",
@@ -378,7 +378,7 @@ describe("x402 paywall", () => {
       "http://127.0.0.1:4021/wallet/profile?address=HD1ryR3dYSXBVNGfJZydbpmnChiE1wrAQkupWWtHt4pM",
     );
     expect(profile.status).toBe(402);
-    expect((await profile.json()).accepts[0].amount).toBe("10000");
+    expect((await profile.json()).accepts[0].amount).toBe("9000");
   });
 
   it("describes wallet_funding on the paid MCP surface", async () => {
@@ -392,9 +392,9 @@ describe("x402 paywall", () => {
     const tools = (await listed.json()).result.tools as Array<{ name: string; description: string }>;
     const funding = tools.find((tool) => tool.name === "wallet_funding");
     expect(funding?.description).toMatch(/first SOL funder/i);
-    expect(funding?.description).toContain("$0.02");
+    expect(funding?.description).toContain("$0.009");
     expect(funding?.description).toMatch(/cluster/i);
-    expect(tools.find((tool) => tool.name === "wallet_profile")?.description).toContain("$0.01");
+    expect(tools.find((tool) => tool.name === "wallet_profile")?.description).toContain("$0.009");
     expect(tools.find((tool) => tool.name === "ping")?.description).toMatch(/free/i);
 
     const called = await app.request("http://127.0.0.1:4021/mcp", {
@@ -410,7 +410,7 @@ describe("x402 paywall", () => {
     const payload = await called.json();
     expect(payload.result.isError).toBe(true);
     const payment = JSON.parse(payload.result.content[0].text);
-    expect(payment.accepts.every((accept: { amount: string }) => accept.amount === "20000")).toBe(true);
+    expect(payment.accepts.every((accept: { amount: string }) => accept.amount === "9000")).toBe(true);
     expect(payment.extensions.bazaar.info.input.toolName).toBe("wallet_funding");
   });
 });

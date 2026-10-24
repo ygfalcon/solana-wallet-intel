@@ -7,11 +7,11 @@ import { createApp } from "../src/app.js";
 import { SOLANA_DEVNET, mockFacilitator, testEnv } from "./helpers.js";
 
 const PAID_AMOUNTS: Record<string, string> = {
-  "/wallet/profile": "10000",
-  "/wallet/funding": "20000",
+  "/wallet/profile": "9000",
+  "/wallet/funding": "9000",
   "/wallet/quick": "2000",
   "/wallet/quick/batch": "15000",
-  "/token/trending": "5000",
+  "/token/trending": "1800",
 };
 
 /** Same Accept header @agentcash/discovery sends on an unpaid probe. */
@@ -149,14 +149,14 @@ describe("x402scan unpaid probe", () => {
       const operation = spec.paths[path].get;
       expect(operation["x-payment-info"].price).toBe(
         path === "/wallet/profile"
-          ? "$0.01"
+          ? "$0.009"
           : path === "/wallet/funding"
-            ? "$0.02"
+            ? "$0.009"
             : path === "/wallet/quick"
               ? "$0.002"
               : path === "/wallet/quick/batch"
                 ? "$0.015"
-                : "$0.005",
+                : "$0.0018",
       );
       expect(operation["x-payment-info"].amount).toBe(PAID_AMOUNTS[path]);
       expect(operation["x-payment-info"].protocols).toEqual([{ x402: {} }]);

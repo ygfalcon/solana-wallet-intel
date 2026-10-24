@@ -10,8 +10,6 @@ export function testEnv() {
     SOLANA_PAY_TO: DEFAULT_SOLANA_PAY_TO,
     EVM_PAY_TO: TEST_EVM_PAY_TO,
     WALLET_CLUSTER: "mainnet",
-    PRICE_WALLET_PROFILE: "$0.01",
-    PRICE_TOKEN_TRENDING: "$0.005",
     PUBLIC_BASE_URL: "http://127.0.0.1:4021",
   });
 }

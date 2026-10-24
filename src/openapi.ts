@@ -65,7 +65,7 @@ export function buildOpenApi(env: AppEnv, operations: PaidOperation[], accepts: 
       title: "Solana Wallet x402",
       version: "1.0.0",
       description:
-        "Pay-per-call Solana wallet profiles, funding-source clusters, and trending tokens. Agents pay USDC over x402 on Solana, and on Base through the Coinbase CDP facilitator when it is configured. GET /token/trending costs $0.005 and includes holder concentration, mint and freeze authority, LP lock or burn status, and sniper or bundle share of early supply. Risky results are plain-English risk flags.",
+        "Pay-per-call Solana wallet profiles, funding-source clusters, and trending tokens. Agents pay USDC over x402 on Solana, and on Base through the Coinbase CDP facilitator when it is configured. GET /token/trending costs $0.0018 and includes holder concentration, mint and freeze authority, LP lock or burn status, and sniper or bundle share of early supply. Risky results are plain-English risk flags.",
       contact: { email: "falconsol@mail.grokbot.com" },
       "x-payment-info": {
         protocol: "x402",
