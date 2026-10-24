@@ -27,6 +27,7 @@ import {
 import { SOL_MINT, TOKEN_2022_PROGRAM, TOKEN_PROGRAM } from "../solana.js";
 import { positiveUsd, loadTokenMeta } from "./prices.js";
 import { closeAt, loadSolUsdSeries } from "./sol-history.js";
+import { scoreCopyTrade, type CopyTradeAssessment, type CopyTradeGrade } from "../copy-trade.js";
 
 export type WalletProfile = {
   address: string;
@@ -55,6 +56,9 @@ export type WalletProfile = {
   pnl: ReturnType<typeof estimatePnl>;
   labels: string[];
   labelDetails: ReturnType<typeof describeWallet>["details"];
+  copyTradeScore: number | null;
+  copyTradeGrade: CopyTradeGrade | null;
+  copyTrade: CopyTradeAssessment;
   sources: string[];
   warnings: string[];
   cached: boolean;
@@ -517,12 +521,25 @@ export async function buildWalletProfile(
     pnl,
     labels: described.labels,
   });
+  const copyTrade = scoreCopyTrade({
+    trades: activity.trades,
+    prices,
+    labels: described.labels,
+    medianSwapGapSeconds: medianSwapGap,
+    swapCount: swaps.length,
+    historyTruncated,
+    firstActiveAt,
+  });
+  const summaryWithScore =
+    copyTrade.score == null || copyTrade.grade == null
+      ? summary
+      : `${summary} Copy-trade score is ${copyTrade.score.toFixed(3)} (${copyTrade.grade}) after a 3s delay and a 3.6% round trip on ${copyTrade.sampleSize} copyable ${copyTrade.sampleSize === 1 ? "close" : "closes"}.`;
 
   return {
     address,
     asOf: new Date().toISOString(),
     dataCluster: env.walletCluster,
-    summary,
+    summary: summaryWithScore,
     window: {
       transactions: activity.signatureCount,
       from: firstActiveAt,
@@ -542,6 +559,9 @@ export async function buildWalletProfile(
     pnl,
     labels: described.labels,
     labelDetails: described.details,
+    copyTradeScore: copyTrade.score,
+    copyTradeGrade: copyTrade.grade,
+    copyTrade,
     sources: [...new Set(sources)],
     warnings: warnings.map((warning) => redactSecrets(warning)),
   };

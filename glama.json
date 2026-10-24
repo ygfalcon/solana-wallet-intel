@@ -1,5 +1,5 @@
 {
   "$schema": "https://glama.ai/mcp/schemas/server.json",
   "maintainers": ["ygfalcon"],
-  "description": "Solana wallet intelligence for AI agents. Free MCP tool wallet_preview (SOL balance, last active, 24h transaction count). Paid x402 tools: wallet_quick ($0.002 copy-trade screen), wallet_profile ($0.01 holdings and PnL), wallet_funding ($0.02 first funder and sybil cluster), token_trending ($0.005 with holder, authority, LP, and sniper checks). No API key. Invalid arguments are rejected before payment. Streamable HTTP at /mcp."
+  "description": "Solana wallet intelligence for AI agents. Free MCP tool wallet_preview (SOL balance, last active, 24h transaction count). Paid x402 tools: wallet_quick ($0.002 copy-trade screen), wallet_quick_batch ($0.015 up to 10 wallets), wallet_profile ($0.009 holdings and PnL), wallet_funding ($0.009 first funder and sybil cluster), token_trending ($0.0018 with holder, authority, LP, and sniper checks). No API key. Invalid arguments are rejected before payment. Streamable HTTP at /mcp."
 }

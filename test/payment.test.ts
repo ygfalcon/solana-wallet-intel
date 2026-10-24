@@ -1,6 +1,7 @@
 import { encodePaymentSignatureHeader } from "@x402/core/http";
 import { describe, expect, it } from "vitest";
 import { createApp } from "../src/app.js";
+import { emptyCopyTrade } from "../src/copy-trade.js";
 import { UpstreamError } from "../src/http.js";
 import { BASE_SEPOLIA, SOLANA_DEVNET, USDC_BASE_SEPOLIA, USDC_SOLANA_DEVNET, mockFacilitator, testEnv } from "./helpers.js";
 
@@ -29,6 +30,9 @@ const walletFixture = {
   },
   labels: ["active memecoin trader"],
   labelDetails: [],
+  copyTradeScore: 0.72,
+  copyTradeGrade: "B" as const,
+  copyTrade: { ...emptyCopyTrade(), score: 0.72, grade: "B" as const },
   sources: ["test"],
   warnings: [],
 };
@@ -234,6 +238,8 @@ describe("x402 paywall", () => {
     expect(paid.status).toBe(200);
     const profile = await paid.json();
     expect(profile.labels).toContain("active memecoin trader");
+    expect(profile.copyTradeScore).toBe(0.72);
+    expect(profile.copyTradeGrade).toBe("B");
     expect(facilitator.settleCalls).toHaveLength(1);
     expect(facilitator.settleCalls[0].amount).toBe("9000");
 

@@ -28,8 +28,8 @@ function priceOf(operations: PaidOperation[], id: PaidOperation["id"]): string {
 
 function callOrder(operations: PaidOperation[]): string[] {
   return [
-    `- Call \`wallet_quick\` (${priceOf(operations, "wallet_quick")}) for a copy-trade screen: realized PnL, win rate, closed trades, and bot, exchange, net-winner, and dormant flags.`,
-    `- Call \`wallet_quick_batch\` (${priceOf(operations, "wallet_quick_batch")}) to screen up to 10 wallets in one paid call, ranked by realized PnL. \`addresses\` is 1 to 10 comma-separated base58 addresses.`,
+    `- Call \`wallet_quick\` (${priceOf(operations, "wallet_quick")}) for a copy-trade screen: realized PnL, win rate, closed trades, copyTradeScore, copyTradeGrade, and bot, exchange, net-winner, and dormant flags.`,
+    `- Call \`wallet_quick_batch\` (${priceOf(operations, "wallet_quick_batch")}) to screen up to 10 wallets in one paid call, ranked by realized PnL, each with copyTradeScore and copyTradeGrade. \`addresses\` is 1 to 10 comma-separated base58 addresses.`,
     `- Call \`wallet_profile\` (${priceOf(operations, "wallet_profile")}) for priced holdings, windowed PnL, and evidence-backed labels. \`txLimit\` is an integer from 5 to 25 and defaults to 20.`,
     `- Call \`wallet_funding\` (${priceOf(operations, "wallet_funding")}) for the first SOL funder and a sybil cluster. \`peers\` compares up to 8 other wallets.`,
     `- Call \`token_trending\` (${priceOf(operations, "token_trending")}) for trending Solana tokens with plain-English risk flags. \`limit\` is an integer from 1 to 25 and defaults to 15.`,

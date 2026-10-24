@@ -51,7 +51,7 @@ export function paidOperations(env: AppEnv): PaidOperation[] {
       amount: usdToBaseUnits(env.priceWalletProfile),
       summary: "Solana wallet profile",
       description:
-        "Use this when you need priced holdings and windowed PnL for one Solana wallet. Holdings valued in USD, a short plain-language summary, windowed realized and unrealized PnL, win rate, and evidence-backed labels such as active memecoin trader. txLimit is an integer from 5 to 25 and defaults to 20. Call free wallet_preview first if you only need SOL balance and last-active time, or wallet_quick for a cheaper copy-trade screen.",
+        "Use this when you need priced holdings and windowed PnL for one Solana wallet. Holdings valued in USD, a short plain-language summary, windowed realized and unrealized PnL, win rate, and evidence-backed labels such as active memecoin trader. Includes copyTradeScore and copyTradeGrade: copy-return after a 3s delay and a 3.6% round trip, win rate, sample-size shrinkage, and bot or insider penalties. The score is null when no close lasted at least 3 seconds. txLimit is an integer from 5 to 25 and defaults to 20. Call free wallet_preview first if you only need SOL balance and last-active time, or wallet_quick for a cheaper copy-trade screen.",
       inputSchema: {
         type: "object",
         properties: {
@@ -86,6 +86,8 @@ export function paidOperations(env: AppEnv): PaidOperation[] {
           },
         ],
         pnl: { realizedUsd: 42.1, unrealizedUsd: -8.4, winRate: 0.6, partialCostBasis: false, priceBasis: "execution" },
+        copyTradeScore: 0.556,
+        copyTradeGrade: "C",
       },
     },
     {
@@ -195,7 +197,7 @@ export function paidOperations(env: AppEnv): PaidOperation[] {
       amount: usdToBaseUnits(env.priceWalletQuick),
       summary: "Solana wallet quick screen",
       description:
-        "Use this for a cheap copy-trade screen before paying for a full profile. Cheap copy-trade screen for one wallet: windowed realized PnL, win rate, closed trades, last active time, and bot, exchange, net-winner and dormant flags. Free teaser at /wallet/preview; full report at /wallet/profile.",
+        "Use this for a cheap copy-trade screen before paying for a full profile. Cheap copy-trade screen for one wallet: windowed realized PnL, win rate, closed trades, last active time, bot, exchange, net-winner and dormant flags, plus copyTradeScore and copyTradeGrade (copy-return after a 3s delay and a 3.6% round trip, win rate, sample-size shrinkage, bot and insider penalties). Free teaser at /wallet/preview; full report at /wallet/profile.",
       inputSchema: {
         type: "object",
         properties: {
@@ -219,6 +221,8 @@ export function paidOperations(env: AppEnv): PaidOperation[] {
         portfolioUsd: 1280.4,
         lastActiveAt: "2026-10-23T18:00:00.000Z",
         windowTransactions: 25,
+        copyTradeScore: 0.556,
+        copyTradeGrade: "C",
       },
     },
     {
@@ -230,7 +234,7 @@ export function paidOperations(env: AppEnv): PaidOperation[] {
       amount: usdToBaseUnits(env.priceWalletQuickBatch),
       summary: "Batch quick screen, up to 10 wallets",
       description:
-        "Quick screen (windowed realized PnL, win rate, bot, exchange, net-winner and dormant flags) for up to 10 Solana wallets in one paid call, ranked by realized PnL. Pass addresses comma-separated.",
+        "Quick screen (windowed realized PnL, win rate, copyTradeScore, copyTradeGrade, bot, exchange, net-winner and dormant flags) for up to 10 Solana wallets in one paid call, ranked by realized PnL. Pass addresses comma-separated.",
       inputSchema: {
         type: "object",
         properties: {
@@ -245,7 +249,7 @@ export function paidOperations(env: AppEnv): PaidOperation[] {
       example: { addresses: "HD1ryR3dYSXBVNGfJZydbpmnChiE1wrAQkupWWtHt4pM,suqh5sHtr8HyJ7q8scBimULPkPpA557prMG47xCHQfK" },
       outputExample: {
         asOf: "2026-10-24T12:00:00.000Z",
-        wallets: [{ address: "HD1ryR3dYSXBVNGfJZydbpmnChiE1wrAQkupWWtHt4pM", realizedUsd: 42.1, winRate: 0.6, bot: false, smartMoney: false }],
+        wallets: [{ address: "HD1ryR3dYSXBVNGfJZydbpmnChiE1wrAQkupWWtHt4pM", realizedUsd: 42.1, winRate: 0.6, bot: false, smartMoney: false, copyTradeScore: 0.556, copyTradeGrade: "C" }],
         errors: [],
       },
     },
