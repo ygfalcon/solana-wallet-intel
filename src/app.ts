@@ -21,6 +21,7 @@ import { redactSecrets, UpstreamError } from "./http.js";
 import { buildLlmsTxt, trendingPricingNote } from "./llms.js";
 import { createSlaTracker, runWithSla, type SlaSnapshot } from "./sla.js";
 import { buildOpenApi } from "./openapi.js";
+import { faviconIco } from "./favicon.js";
 import { isSolanaAddress } from "./solana.js";
 import { loadWalletFunding, type WalletFunding } from "./services/funding.js";
 import { buildWalletProfile, type WalletProfile } from "./services/wallet.js";
@@ -107,7 +108,7 @@ function discoveryDocument(
             reason: "Set EVM_PAY_TO. Base settlements use the Coinbase CDP facilitator when CDP_API_KEY_ID and CDP_API_KEY_SECRET are set.",
           },
     },
-    resources: operations.map((operation) => ({
+    resources: operations.filter((operation) => operation.amount !== "0").map((operation) => ({
       method: operation.method,
       path: operation.path,
       url: `${origin}${operation.path}`,
@@ -246,8 +247,16 @@ export async function createApp(options: CreateAppOptions = {}) {
     c.res = new Response(JSON.stringify({ ...paymentRequired, inputSchema }), { status: 402, headers });
   });
 
-  // Reject malformed input before asking for payment, so buyers never pay for a 400.
+  // x402scan probes paid routes with no query, or with a placeholder query, and
+  // treats anything other than a 402 as unprotected. Let those unpaid calls
+  // reach the paywall. Once a PAYMENT-SIGNATURE is present, reject bad input
+  // here so settlement never runs.
   app.use("*", async (c, next) => {
+    const paymentSignature = c.req.header("payment-signature")?.trim();
+    if (!paymentSignature) {
+      await next();
+      return;
+    }
     const path = new URL(c.req.url).pathname;
     if (path === "/wallet/profile" || path === "/wallet/quick" || path === "/wallet/funding") {
       const a = c.req.query("address")?.trim() ?? "";
@@ -289,6 +298,16 @@ export async function createApp(options: CreateAppOptions = {}) {
         walletFunding: `${origin}/wallet/funding`,
         trending: `${origin}/token/trending`,
         llms: `${origin}/llms.txt`,
+      },
+    });
+  });
+
+  app.get("/favicon.ico", (c) => {
+    return new Response(faviconIco, {
+      status: 200,
+      headers: {
+        "content-type": "image/x-icon",
+        "cache-control": "public, max-age=86400",
       },
     });
   });
